@@ -26,22 +26,67 @@ import (
 
 const docType = "recipe"
 
+// ErrReadOnly is returned by Upsert/Delete when the store was opened
+// in read-only mode (because another process holds the writer lock).
+var ErrReadOnly = errors.New("store is read-only; another process holds the writer lock")
+
 type Store struct {
-	idx    bleve.Index
-	logger *slog.Logger
+	path     string
+	logger   *slog.Logger
+	readOnly bool
 
 	// upsertMu serializes index writes so a sync pass and a tool-driven
 	// create/update cannot interleave on the same UID.
 	upsertMu sync.Mutex
+
+	// idxMu protects idx — readers may swap it during Reload() to pick
+	// up commits from the writer process, and any in-flight Search/Get
+	// must hold a read lock for the duration of their query.
+	idxMu sync.RWMutex
+	idx   bleve.Index
 }
 
-// Open opens or creates the index at path.
-func Open(path string, logger *slog.Logger) (*Store, error) {
+// Options configures Open.
+type Options struct {
+	Path     string       // index directory (e.g. ~/.local/state/paprika-3-mcp/<userhash>/recipes.bleve)
+	ReadOnly bool         // true → open Bleve read-only, refuse writes, allow Reload
+	Logger   *slog.Logger
+}
+
+// Open opens or creates the index. When ReadOnly is true, Upsert and
+// Delete return ErrReadOnly and Reload() may be used to refresh the
+// in-memory view from disk after another process has committed.
+func Open(opts Options) (*Store, error) {
+	logger := opts.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(opts.Path), 0o700); err != nil {
 		return nil, fmt.Errorf("create index parent dir: %w", err)
+	}
+
+	idx, err := openIndex(opts.Path, opts.ReadOnly)
+	if err != nil {
+		return nil, err
+	}
+	return &Store{
+		path:     opts.Path,
+		logger:   logger,
+		readOnly: opts.ReadOnly,
+		idx:      idx,
+	}, nil
+}
+
+func openIndex(path string, readOnly bool) (bleve.Index, error) {
+	if readOnly {
+		// Read-only opens never create; if the writer hasn't materialized
+		// the index yet the reader returns the existence error, and the
+		// caller can retry Reload later.
+		idx, err := bleve.OpenUsing(path, map[string]interface{}{"read_only": true})
+		if err != nil {
+			return nil, fmt.Errorf("open bleve index read-only at %s: %w", path, err)
+		}
+		return idx, nil
 	}
 
 	idx, err := bleve.Open(path)
@@ -51,22 +96,54 @@ func Open(path string, logger *slog.Logger) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open bleve index at %s: %w", path, err)
 	}
-	return &Store{idx: idx, logger: logger}, nil
+	return idx, nil
 }
 
+// Reload closes and reopens the index. Read-only callers use this to
+// pick up changes the writer process has committed to disk. No-op for
+// writers (and a hard error if called).
+func (s *Store) Reload() error {
+	if !s.readOnly {
+		return errors.New("Reload() is only valid on a read-only Store")
+	}
+	fresh, err := openIndex(s.path, true)
+	if err != nil {
+		return err
+	}
+	s.idxMu.Lock()
+	old := s.idx
+	s.idx = fresh
+	s.idxMu.Unlock()
+	if old != nil {
+		_ = old.Close()
+	}
+	return nil
+}
+
+// ReadOnly reports whether this Store rejects writes.
+func (s *Store) ReadOnly() bool { return s.readOnly }
+
 func (s *Store) Close() error {
+	s.idxMu.Lock()
+	defer s.idxMu.Unlock()
 	return s.idx.Close()
 }
 
 // Upsert indexes (or replaces) a single recipe. Trashed recipes are deleted
 // from the index instead of stored, so search results never include them.
+// Returns ErrReadOnly when the Store is read-only.
 func (s *Store) Upsert(r *paprika.Recipe) error {
+	if s.readOnly {
+		return ErrReadOnly
+	}
 	if r == nil || r.UID == "" {
 		return errors.New("recipe must have UID")
 	}
 	s.upsertMu.Lock()
 	defer s.upsertMu.Unlock()
 
+	s.idxMu.RLock()
+	defer s.idxMu.RUnlock()
 	if r.InTrash {
 		return s.idx.Delete(r.UID)
 	}
@@ -74,9 +151,15 @@ func (s *Store) Upsert(r *paprika.Recipe) error {
 }
 
 // Delete removes a UID from the index. No error if it isn't there.
+// Returns ErrReadOnly when the Store is read-only.
 func (s *Store) Delete(uid string) error {
+	if s.readOnly {
+		return ErrReadOnly
+	}
 	s.upsertMu.Lock()
 	defer s.upsertMu.Unlock()
+	s.idxMu.RLock()
+	defer s.idxMu.RUnlock()
 	return s.idx.Delete(uid)
 }
 
@@ -84,6 +167,8 @@ func (s *Store) Delete(uid string) error {
 // DocID query — simpler and more portable than poking at the internal
 // index.Document interface.
 func (s *Store) Get(uid string) (*paprika.Recipe, error) {
+	s.idxMu.RLock()
+	defer s.idxMu.RUnlock()
 	q := bleve.NewDocIDQuery([]string{uid})
 	req := bleve.NewSearchRequestOptions(q, 1, 0, false)
 	req.Fields = []string{"_raw"}
@@ -108,6 +193,8 @@ func (s *Store) Get(uid string) (*paprika.Recipe, error) {
 // HashesByUID returns every (uid -> hash) pair currently in the index.
 // Used by the syncer to decide which recipes need refetching.
 func (s *Store) HashesByUID() (map[string]string, error) {
+	s.idxMu.RLock()
+	defer s.idxMu.RUnlock()
 	q := bleve.NewMatchAllQuery()
 	out := map[string]string{}
 
@@ -191,6 +278,8 @@ func (s *Store) Search(opts SearchOptions) ([]SearchHit, error) {
 	req.Highlight = bleve.NewHighlight()
 	req.Highlight.Fields = []string{"name", "ingredients", "directions", "notes", "description"}
 
+	s.idxMu.RLock()
+	defer s.idxMu.RUnlock()
 	res, err := s.idx.Search(req)
 	if err != nil {
 		return nil, err

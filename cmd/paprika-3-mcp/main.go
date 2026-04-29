@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -9,6 +12,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/brendanjerwin/paprika-3-mcp/internal/mcpserver"
 	"github.com/brendanjerwin/paprika-3-mcp/internal/paprika"
@@ -32,9 +36,21 @@ func defaultDataDir() string {
 	return filepath.Join(os.TempDir(), "paprika-3-mcp")
 }
 
+// userNamespace returns a stable 16-hex-char fingerprint of the
+// Paprika username. We hash so the directory name is filesystem-safe
+// and so passwords (which we never read here) can't leak through path
+// inspection. Two processes with different credentials get different
+// directories; same credentials → same directory and they coordinate
+// through flock.
+func userNamespace(username string) string {
+	sum := sha256.Sum256([]byte(username))
+	return hex.EncodeToString(sum[:8])
+}
+
 func main() {
-	dataDir := flag.String("data-dir", defaultDataDir(), "Local index location (overrides $XDG_STATE_HOME/paprika-3-mcp)")
+	dataDir := flag.String("data-dir", defaultDataDir(), "Per-host root for paprika-3-mcp state. The actual index lives at <data-dir>/<userhash>/recipes.bleve.")
 	logLevel := flag.String("log-level", "info", "Log level: debug, info, warn, error")
+	readerReopenInterval := flag.Duration("reader-reopen", 60*time.Second, "How often a read-only Store reloads to pick up the writer's commits.")
 	showVersion := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
 
@@ -62,11 +78,36 @@ func main() {
 		level = slog.LevelError
 	}
 
-	// Logs go to stderr — stdio is reserved for MCP JSON-RPC. The upstream
-	// wrote to /var/log/paprika-3-mcp/server.log, which silently failed
-	// for non-root users on Linux.
+	// Logs go to stderr — stdio is reserved for MCP JSON-RPC.
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
-	logger.Info("paprika-3-mcp starting", "version", version, "data_dir", *dataDir)
+
+	// Per-credential namespace prevents collisions between different
+	// Paprika accounts on the same host.
+	userDir := filepath.Join(*dataDir, userNamespace(username))
+	if err := os.MkdirAll(userDir, 0o700); err != nil {
+		logger.Error("create user state dir failed", "dir", userDir, "err", err)
+		os.Exit(1)
+	}
+	indexPath := filepath.Join(userDir, "recipes.bleve")
+	lockPath := filepath.Join(userDir, "writer.lock")
+
+	logger.Info("paprika-3-mcp starting",
+		"version", version,
+		"index", indexPath,
+		"pid", os.Getpid(),
+	)
+
+	// Try to be the writer. Non-blocking: if another instance already
+	// holds the lock we open read-only and run as a passive consumer.
+	writerLock, lockErr := store.TryLock(lockPath)
+	role := "writer"
+	if errors.Is(lockErr, store.ErrLockHeld) {
+		role = "reader"
+		logger.Info("another writer is active; running read-only", "lock", lockPath)
+	} else if lockErr != nil {
+		logger.Error("acquire writer lock failed", "lock", lockPath, "err", lockErr)
+		os.Exit(1)
+	}
 
 	// NewClient no longer logs in synchronously — the actual auth
 	// round-trip happens on first authenticated request, so the MCP
@@ -77,24 +118,29 @@ func main() {
 		os.Exit(1)
 	}
 
-	indexPath := filepath.Join(*dataDir, "recipes.bleve")
-	st, err := store.Open(indexPath, logger)
+	st, err := openStoreWithRetry(indexPath, role == "reader", logger)
 	if err != nil {
 		logger.Error("open index failed", "err", err)
 		os.Exit(1)
 	}
 	defer st.Close()
 
-	sync := syncer.New(syncer.Options{
-		Client: client,
-		Store:  st,
-		Logger: logger,
-	})
-
 	rootCtx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	go sync.Run(rootCtx)
+	var sync *syncer.Syncer
+	if role == "writer" {
+		sync = syncer.New(syncer.Options{
+			Client: client,
+			Store:  st,
+			Logger: logger,
+		})
+		go sync.Run(rootCtx)
+		// Held until process exit; OS releases on death.
+		defer writerLock.Close()
+	} else {
+		go runReaderReloader(rootCtx, st, *readerReopenInterval, logger)
+	}
 
 	srv, err := mcpserver.NewServer(mcpserver.NewServerOptions{
 		Version: version,
@@ -107,9 +153,54 @@ func main() {
 		logger.Error("server init failed", "err", err)
 		os.Exit(1)
 	}
+	logger.Info("ready", "role", role)
 
 	if err := srv.Serve(rootCtx); err != nil {
 		logger.Error("server exited with error", "err", err)
 		os.Exit(1)
+	}
+}
+
+// openStoreWithRetry handles the cold-start race: if a reader spawns
+// before the writer has materialized the index, the read-only Open
+// fails with "index does not exist". Retry briefly so the reader
+// catches up rather than crashing — but stay well within an MCP
+// handshake window (50 × 100ms = 5s budget).
+func openStoreWithRetry(path string, readOnly bool, logger *slog.Logger) (*store.Store, error) {
+	const maxAttempts = 50
+	const interval = 100 * time.Millisecond
+	var lastErr error
+	for i := 0; i < maxAttempts; i++ {
+		st, err := store.Open(store.Options{Path: path, ReadOnly: readOnly, Logger: logger})
+		if err == nil {
+			return st, nil
+		}
+		lastErr = err
+		if !readOnly {
+			// Writers don't retry — Open creates the directory if missing.
+			return nil, err
+		}
+		logger.Debug("reader waiting for writer to create index", "err", err, "attempt", i+1)
+		time.Sleep(interval)
+	}
+	return nil, fmt.Errorf("waiting for writer-created index: %w", lastErr)
+}
+
+// runReaderReloader periodically calls store.Reload() so the reader
+// process picks up commits the writer has flushed to disk. Bleve has
+// no inotify-style mechanism for cross-process change notifications,
+// so polling is the simplest correct option.
+func runReaderReloader(ctx context.Context, st *store.Store, every time.Duration, logger *slog.Logger) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := st.Reload(); err != nil {
+				logger.Warn("reader reload failed", "err", err)
+			}
+		}
 	}
 }

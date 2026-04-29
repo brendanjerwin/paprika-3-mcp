@@ -7,6 +7,7 @@ toolchain go1.23.8
 require (
 	github.com/blevesearch/bleve/v2 v2.5.7
 	github.com/google/uuid v1.6.0
+	golang.org/x/sys v0.29.0
 )
 
 require (
@@ -39,7 +40,6 @@ require (
 	github.com/spf13/cast v1.7.1 // indirect
 	github.com/wk8/go-ordered-map/v2 v2.1.8 // indirect
 	go.etcd.io/bbolt v1.4.0 // indirect
-	golang.org/x/sys v0.29.0 // indirect
 	google.golang.org/protobuf v1.36.6 // indirect
 )
 

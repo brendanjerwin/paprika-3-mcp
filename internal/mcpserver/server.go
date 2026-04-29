@@ -299,14 +299,26 @@ func (s *Server) handleCreate(ctx context.Context, req mcp.CallToolRequest) (*mc
 	if err != nil {
 		return nil, err
 	}
-	if err := s.store.Upsert(saved); err != nil {
-		s.logger.Warn("local upsert after create failed", "uid", saved.UID, "err", err)
-	}
+	s.tryUpsertLocal(saved, "create")
 	return mcp.NewToolResultResource(saved.Name, mcp.TextResourceContents{
 		URI:      fmt.Sprintf("paprika://recipes/%s", saved.UID),
 		MIMEType: "text/markdown",
 		Text:     saved.ToMarkdown(),
 	}), nil
+}
+
+// tryUpsertLocal writes a saved recipe to the local index. In read-only
+// mode it skips silently — the writer process will pick the change up
+// from Paprika cloud on its next sync pass, and other readers will
+// catch up on their next Reload.
+func (s *Server) tryUpsertLocal(r *paprika.Recipe, op string) {
+	if err := s.store.Upsert(r); err != nil {
+		if errors.Is(err, store.ErrReadOnly) {
+			s.logger.Debug("read-only store: skipped local upsert", "op", op, "uid", r.UID)
+			return
+		}
+		s.logger.Warn("local upsert failed", "op", op, "uid", r.UID, "err", err)
+	}
 }
 
 // handleUpdate fetches the existing recipe (so we keep server-managed
@@ -383,9 +395,7 @@ func (s *Server) handleUpdate(ctx context.Context, req mcp.CallToolRequest) (*mc
 	if err != nil {
 		return nil, err
 	}
-	if err := s.store.Upsert(saved); err != nil {
-		s.logger.Warn("local upsert after update failed", "uid", saved.UID, "err", err)
-	}
+	s.tryUpsertLocal(saved, "update")
 	return mcp.NewToolResultResource(saved.Name, mcp.TextResourceContents{
 		URI:      fmt.Sprintf("paprika://recipes/%s", saved.UID),
 		MIMEType: "text/markdown",
