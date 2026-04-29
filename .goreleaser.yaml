@@ -15,10 +15,14 @@ builds:
     binary: paprika-3-mcp
     env:
       - CGO_ENABLED=0
+    # No Windows: the flock-based writer election in internal/store/lock.go
+    # uses golang.org/x/sys/unix and won't cross-compile to GOOS=windows.
+    # The fork's primary consumer is a Linux agent toolbox; macOS targets
+    # cover dev laptops. If anyone ever wants Windows, that's the moment
+    # to add a syscall-windows lock implementation behind a build tag.
     goos:
       - linux
       - darwin
-      - windows
     goarch:
       - amd64
       - arm64
