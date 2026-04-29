@@ -170,20 +170,16 @@ type searchResponse struct {
 }
 
 func (s *Server) handleSearch(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	query, _ := req.Params.Arguments["query"].(string)
-	if query == "" {
-		return nil, errors.New("query is required")
+	query, err := req.RequireString("query")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	opts := store.SearchOptions{Query: query}
-	if v, ok := req.Params.Arguments["limit"].(float64); ok {
-		opts.Limit = int(v)
-	}
-	if v, ok := req.Params.Arguments["min_rating"].(float64); ok {
-		opts.MinRating = int(v)
-	}
-	if v, ok := req.Params.Arguments["category"].(string); ok {
-		opts.Category = v
+	opts := store.SearchOptions{
+		Query:     query,
+		Limit:     req.GetInt("limit", 0),
+		MinRating: req.GetInt("min_rating", 0),
+		Category:  req.GetString("category", ""),
 	}
 
 	hits, err := s.store.Search(opts)
@@ -199,16 +195,16 @@ func (s *Server) handleSearch(_ context.Context, req mcp.CallToolRequest) (*mcp.
 }
 
 func (s *Server) handleGet(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	uid, _ := req.Params.Arguments["uid"].(string)
-	if uid == "" {
-		return nil, errors.New("uid is required")
+	uid, err := req.RequireString("uid")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 	recipe, err := s.store.Get(uid)
 	if err != nil {
 		return nil, err
 	}
 	if recipe == nil {
-		return nil, fmt.Errorf("recipe %q not found", uid)
+		return mcp.NewToolResultError(fmt.Sprintf("recipe %q not found", uid)), nil
 	}
 	return mcp.NewToolResultResource(recipe.Name, mcp.TextResourceContents{
 		URI:      fmt.Sprintf("paprika://recipes/%s", recipe.UID),
@@ -218,11 +214,34 @@ func (s *Server) handleGet(_ context.Context, req mcp.CallToolRequest) (*mcp.Cal
 }
 
 func (s *Server) handleCreate(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	r, err := recipeFromArgs(req.Params.Arguments, false)
+	name, err := req.RequireString("name")
 	if err != nil {
-		return nil, err
+		return mcp.NewToolResultError(err.Error()), nil
 	}
-	saved, err := s.paprika3.SaveRecipe(ctx, *r)
+	ingredients, err := req.RequireString("ingredients")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	directions, err := req.RequireString("directions")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	recipe := paprika.Recipe{
+		Name:        name,
+		Ingredients: ingredients,
+		Directions:  directions,
+		Description: req.GetString("description", ""),
+		Notes:       req.GetString("notes", ""),
+		Servings:    req.GetString("servings", ""),
+		PrepTime:    req.GetString("prep_time", ""),
+		CookTime:    req.GetString("cook_time", ""),
+		Difficulty:  req.GetString("difficulty", ""),
+		Source:      req.GetString("source", ""),
+		SourceURL:   req.GetString("source_url", ""),
+	}
+
+	saved, err := s.paprika3.SaveRecipe(ctx, recipe)
 	if err != nil {
 		return nil, err
 	}
@@ -236,12 +255,77 @@ func (s *Server) handleCreate(ctx context.Context, req mcp.CallToolRequest) (*mc
 	}), nil
 }
 
+// handleUpdate fetches the existing recipe (so we keep server-managed
+// fields the LLM doesn't see — categories, photo, photo_hash, rating,
+// etc.) and overlays only the fields the caller provided. This is the
+// fix for upstream issue soggycactus/paprika-3-mcp#7, where overwriting
+// the whole record nulled out `categories`/`collection` and broke
+// Paprika's mobile-app sync ("Value cannot be null").
 func (s *Server) handleUpdate(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	r, err := recipeFromArgs(req.Params.Arguments, true)
+	uid, err := req.RequireString("uid")
 	if err != nil {
-		return nil, err
+		return mcp.NewToolResultError(err.Error()), nil
 	}
-	saved, err := s.paprika3.SaveRecipe(ctx, *r)
+
+	existing, err := s.store.Get(uid)
+	if err != nil {
+		return nil, fmt.Errorf("look up existing recipe: %w", err)
+	}
+	if existing == nil {
+		// Local index miss — fall back to the API. If that fails the
+		// recipe really doesn't exist (or the user hasn't synced).
+		fetched, ferr := s.paprika3.GetRecipe(ctx, uid)
+		if ferr != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("recipe %q not found locally and API lookup failed: %s", uid, ferr)), nil
+		}
+		existing = fetched
+	}
+
+	// Overlay any field the caller provided; otherwise keep the existing
+	// value. RequireString-ish semantics: if the caller passed "" for a
+	// field we treat that as "leave it alone" rather than "blank it out",
+	// because the upstream tool schema marks every text field as required
+	// and clients tend to fill blanks with the empty string.
+	merged := *existing
+	if v, ok := requireOrSkip(req, "name"); ok {
+		merged.Name = v
+	}
+	if v, ok := requireOrSkip(req, "ingredients"); ok {
+		merged.Ingredients = v
+	}
+	if v, ok := requireOrSkip(req, "directions"); ok {
+		merged.Directions = v
+	}
+	if v, ok := requireOrSkip(req, "description"); ok {
+		merged.Description = v
+	}
+	if v, ok := requireOrSkip(req, "notes"); ok {
+		merged.Notes = v
+	}
+	if v, ok := requireOrSkip(req, "servings"); ok {
+		merged.Servings = v
+	}
+	if v, ok := requireOrSkip(req, "prep_time"); ok {
+		merged.PrepTime = v
+	}
+	if v, ok := requireOrSkip(req, "cook_time"); ok {
+		merged.CookTime = v
+	}
+	if v, ok := requireOrSkip(req, "difficulty"); ok {
+		merged.Difficulty = v
+	}
+	if v, ok := requireOrSkip(req, "source"); ok {
+		merged.Source = v
+	}
+	if v, ok := requireOrSkip(req, "source_url"); ok {
+		merged.SourceURL = v
+	}
+
+	if merged.Name == "" {
+		return mcp.NewToolResultError("name must be non-empty after merge"), nil
+	}
+
+	saved, err := s.paprika3.SaveRecipe(ctx, merged)
 	if err != nil {
 		return nil, err
 	}
@@ -255,36 +339,13 @@ func (s *Server) handleUpdate(ctx context.Context, req mcp.CallToolRequest) (*mc
 	}), nil
 }
 
-func recipeFromArgs(args map[string]interface{}, requireUID bool) (*paprika.Recipe, error) {
-	getStr := func(k string) string {
-		if v, ok := args[k].(string); ok {
-			return v
-		}
-		return ""
+// requireOrSkip returns (value, true) iff the caller actually provided a
+// non-empty string for the given key. Empty / missing → (_, false), so
+// the caller can leave the existing field intact during a merge update.
+func requireOrSkip(req mcp.CallToolRequest, key string) (string, bool) {
+	v := req.GetString(key, "")
+	if v == "" {
+		return "", false
 	}
-	r := &paprika.Recipe{
-		UID:         getStr("uid"),
-		Name:        getStr("name"),
-		Ingredients: getStr("ingredients"),
-		Directions:  getStr("directions"),
-		Description: getStr("description"),
-		Notes:       getStr("notes"),
-		Servings:    getStr("servings"),
-		PrepTime:    getStr("prep_time"),
-		CookTime:    getStr("cook_time"),
-		Difficulty:  getStr("difficulty"),
-	}
-	if requireUID && r.UID == "" {
-		return nil, errors.New("uid is required")
-	}
-	if r.Name == "" {
-		return nil, errors.New("name is required")
-	}
-	if r.Ingredients == "" {
-		return nil, errors.New("ingredients are required")
-	}
-	if r.Directions == "" {
-		return nil, errors.New("directions are required")
-	}
-	return r, nil
+	return v, true
 }

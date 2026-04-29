@@ -13,6 +13,7 @@ import (
 	"mime/multipart"
 	"net"
 	"net/http"
+	"net/url"
 	"runtime"
 	"sort"
 	"strings"
@@ -109,7 +110,10 @@ type errorResponse struct {
 // login authenticates with the Paprika API and returns an authentication token
 // The token is used for all subsequent requests to the API. As far as I can tell, this is a JWT with no expiration.
 func login(ctx context.Context, client http.Client, username, password string) (string, error) {
-	body := fmt.Sprintf("email=%s&password=%s", username, password)
+	// URL-encode credentials so passwords containing `&`, `=`, `+`, or
+	// other reserved characters survive the form body intact (see
+	// upstream PR #8).
+	body := url.Values{"email": {username}, "password": {password}}.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://paprikaapp.com/api/v1/account/login", bytes.NewBufferString(body))
 	if err != nil {
 		return "", err
@@ -151,7 +155,7 @@ type RecipeList struct {
 	} `json:"result"`
 }
 
-// SyncStatus is the response from /api/v2/sync/status/. The counters
+// SyncStatus is the response from /api/v3/sync/status/. The counters
 // monotonically increase on each create/update/soft-delete in the
 // matching collection, so the syncer uses the `recipes` counter as a
 // cheap "did anything change?" probe before fetching the full list.
@@ -180,11 +184,11 @@ type syncStatusResponse struct {
 	Result SyncStatus `json:"result"`
 }
 
-// GetSyncStatus fetches /api/v2/sync/status/. Used as a delta probe:
+// GetSyncStatus fetches /api/v3/sync/status/. Used as a delta probe:
 // if the `Recipes` counter is unchanged since the last successful poll,
 // the syncer can skip listing recipes entirely.
 func (c *Client) GetSyncStatus(ctx context.Context) (*SyncStatus, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://paprikaapp.com/api/v2/sync/status/", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://paprikaapp.com/api/v3/sync/status/", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -210,7 +214,7 @@ func (c *Client) GetSyncStatus(ctx context.Context) (*SyncStatus, error) {
 // ListRecipes retrieves a list of recipes from the Paprika API - the response objects
 // only contain the UID and hash of each recipe, not the full recipe object
 func (c *Client) ListRecipes(ctx context.Context) (*RecipeList, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://paprikaapp.com/api/v2/sync/recipes", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://paprikaapp.com/api/v3/sync/recipes", nil)
 	if err != nil {
 		c.logger.Error("failed to create request", "error", err)
 		return nil, err
@@ -292,7 +296,7 @@ func (r *Recipe) ToMarkdown() string {
 		sb.WriteString(fmt.Sprintf("_%s_\n\n", r.Description))
 	}
 
-	if r.Servings != "" || r.PrepTime != "" || r.CookTime != "" || r.Difficulty != "" {
+	if r.Servings != "" || r.PrepTime != "" || r.CookTime != "" || r.Difficulty != "" || r.Source != "" || r.SourceURL != "" {
 		sb.WriteString("## Details\n")
 		if r.Servings != "" {
 			sb.WriteString(fmt.Sprintf("- **Servings:** %s\n", r.Servings))
@@ -305,6 +309,12 @@ func (r *Recipe) ToMarkdown() string {
 		}
 		if r.Difficulty != "" {
 			sb.WriteString(fmt.Sprintf("- **Difficulty:** %s\n", r.Difficulty))
+		}
+		if r.Source != "" {
+			sb.WriteString(fmt.Sprintf("- **Source:** %s\n", r.Source))
+		}
+		if r.SourceURL != "" {
+			sb.WriteString(fmt.Sprintf("- **Source URL:** %s\n", r.SourceURL))
 		}
 		sb.WriteString("\n")
 	}
@@ -425,7 +435,7 @@ type GetRecipeResponse struct {
 }
 
 func (c *Client) GetRecipe(ctx context.Context, uid string) (*Recipe, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("https://paprikaapp.com/api/v2/sync/recipe/%s/", uid), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("https://paprikaapp.com/api/v3/sync/recipe/%s/", uid), nil)
 	if err != nil {
 		c.logger.Error("failed to create request", "error", err)
 		return nil, err
@@ -504,7 +514,7 @@ func (c *Client) SaveRecipe(ctx context.Context, recipe Recipe) (*Recipe, error)
 	}
 
 	// Create the HTTP request
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("https://paprikaapp.com/api/v2/sync/recipe/%s/", recipe.UID), &body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("https://paprikaapp.com/api/v3/sync/recipe/%s/", recipe.UID), &body)
 	if err != nil {
 		c.logger.Error("failed to create request", "error", err)
 		return nil, err
@@ -543,7 +553,7 @@ func (c *Client) SaveRecipe(ctx context.Context, recipe Recipe) (*Recipe, error)
 // notify sends a POST to /v2/sync/notify, which tells all Paprika clients to sync.
 // We usually defer this call after a recipe is created/updated/deleted, since we don't care whether it suceeds or not.
 func (c *Client) notify(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://paprikaapp.com/api/v2/sync/notify", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://paprikaapp.com/api/v3/sync/notify", nil)
 	if err != nil {
 		c.logger.Error("failed to create request", "error", err)
 		return err
