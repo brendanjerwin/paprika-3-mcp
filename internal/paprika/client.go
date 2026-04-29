@@ -82,9 +82,8 @@ type Client struct {
 }
 
 // ensureToken returns the bearer token, performing the login round-trip
-// the first time it's called. Subsequent calls return the cached value.
-// Callers reach this through authTransport.RoundTrip, which is invoked
-// on every authenticated request.
+// the first time it's called (or after invalidateToken cleared the
+// cache because of a 401). Subsequent calls return the cached value.
 func (c *Client) ensureToken(ctx context.Context) (string, error) {
 	c.tokenMu.Lock()
 	defer c.tokenMu.Unlock()
@@ -101,22 +100,79 @@ func (c *Client) ensureToken(ctx context.Context) (string, error) {
 	return tok, nil
 }
 
+// invalidateToken clears the cached token so the next ensureToken call
+// will re-login. Called from authTransport when a request comes back
+// 401, on the assumption that Paprika rotated the JWT or it expired.
+// We compare to the token the failed request used so concurrent calls
+// don't repeatedly invalidate a token that's already been refreshed.
+func (c *Client) invalidateToken(usedToken string) {
+	c.tokenMu.Lock()
+	defer c.tokenMu.Unlock()
+	if c.token == usedToken {
+		c.token = ""
+	}
+}
+
 // authTransport is the round-tripper installed on Client.client. It
 // resolves the bearer token (lazily logging in on first use) and adds
-// Paprika's standard headers to every outgoing request.
+// Paprika's standard headers to every outgoing request. On a 401 it
+// clears the cached token and replays the request once.
 type authTransport struct {
 	c     *Client
 	inner http.RoundTripper
 }
 
 func (a *authTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Buffer the body so we can replay the request on a 401 — Go's
+	// HTTP client closes the body after RoundTrip and won't replay it
+	// for us. Login (no body) and GETs hit the nil branch.
+	var bodyBytes []byte
+	if req.Body != nil {
+		var err error
+		bodyBytes, err = io.ReadAll(req.Body)
+		_ = req.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("buffer request body for retry: %w", err)
+		}
+		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		req.ContentLength = int64(len(bodyBytes))
+	}
+
+	resp, tokUsed, err := a.send(req, bodyBytes)
+	if err != nil {
+		return resp, err
+	}
+	if resp.StatusCode != http.StatusUnauthorized {
+		return resp, nil
+	}
+
+	// 401: drain+close the failed response, drop the cached token,
+	// and replay once. ensureToken on the next attempt will perform
+	// a fresh login.
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	a.c.logger.Info("paprika returned 401; refreshing token and retrying once", "url", req.URL.Path)
+	a.c.invalidateToken(tokUsed)
+
+	if bodyBytes != nil {
+		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		req.ContentLength = int64(len(bodyBytes))
+	}
+	resp, _, err = a.send(req, bodyBytes)
+	return resp, err
+}
+
+// send injects the auth headers and runs the inner round-trip once.
+// Returns the token it used so the 401 path can invalidate it without
+// stomping on a token a concurrent caller already refreshed.
+func (a *authTransport) send(req *http.Request, _ []byte) (*http.Response, string, error) {
 	tok, err := a.c.ensureToken(req.Context())
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	if req.Header.Get("Authorization") == "" {
-		req.Header.Set("Authorization", "Bearer "+tok)
-	}
+	// Strip any prior Authorization (relevant on retry after 401).
+	req.Header.Del("Authorization")
+	req.Header.Set("Authorization", "Bearer "+tok)
 	if req.Header.Get("User-Agent") == "" {
 		req.Header.Set("User-Agent", userAgent(a.c.version))
 	}
@@ -126,7 +182,8 @@ func (a *authTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.Header.Get("Connection") == "" {
 		req.Header.Set("Connection", "keep-alive")
 	}
-	return a.inner.RoundTrip(req)
+	resp, err := a.inner.RoundTrip(req)
+	return resp, tok, err
 }
 
 type loginResponse struct {

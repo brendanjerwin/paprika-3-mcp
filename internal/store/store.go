@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/blevesearch/bleve/v2"
 	"github.com/blevesearch/bleve/v2/analysis/analyzer/keyword"
@@ -48,14 +49,20 @@ type Store struct {
 
 // Options configures Open.
 type Options struct {
-	Path     string       // index directory (e.g. ~/.local/state/paprika-3-mcp/<userhash>/recipes.bleve)
-	ReadOnly bool         // true → open Bleve read-only, refuse writes, allow Reload
-	Logger   *slog.Logger
+	Path        string        // index directory (e.g. ~/.local/state/paprika-3-mcp/<userhash>/recipes.bleve)
+	ReadOnly    bool          // true → open Bleve read-only, refuse writes, allow Reload
+	OpenTimeout time.Duration // applies to read-only opens only; 0 → 5s default
+	Logger      *slog.Logger
 }
 
 // Open opens or creates the index. When ReadOnly is true, Upsert and
 // Delete return ErrReadOnly and Reload() may be used to refresh the
 // in-memory view from disk after another process has committed.
+//
+// Read-only opens are guarded by OpenTimeout to avoid hanging when an
+// active writer holds bbolt's exclusive lock — the underlying scorch
+// open hardcodes Timeout=0 (wait forever). On timeout Open returns
+// ErrOpenTimedOut so the caller can fall back gracefully.
 func Open(opts Options) (*Store, error) {
 	logger := opts.Logger
 	if logger == nil {
@@ -65,7 +72,19 @@ func Open(opts Options) (*Store, error) {
 		return nil, fmt.Errorf("create index parent dir: %w", err)
 	}
 
-	idx, err := openIndex(opts.Path, opts.ReadOnly)
+	var (
+		idx bleve.Index
+		err error
+	)
+	if opts.ReadOnly {
+		deadline := opts.OpenTimeout
+		if deadline <= 0 {
+			deadline = 5 * time.Second
+		}
+		idx, err = openIndexTimed(opts.Path, true, deadline)
+	} else {
+		idx, err = openIndex(opts.Path, false)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -77,11 +96,18 @@ func Open(opts Options) (*Store, error) {
 	}, nil
 }
 
+// ErrOpenTimedOut means the underlying Bleve / bbolt call did not
+// return within the configured deadline. In practice this happens when
+// a writer process holds the scorch root.bolt's exclusive fcntl lock
+// and bbolt's hardcoded Timeout: 0 makes our read-only opener wait
+// forever. Surfacing the timeout as an error lets callers fail-fast
+// instead of hanging the MCP handshake.
+var ErrOpenTimedOut = errors.New("bleve open timed out (writer likely holds an exclusive lock)")
+
+// openIndex synchronously opens (or, for writers, creates) the Bleve
+// index. Used by writers — readers should go through openIndexTimed.
 func openIndex(path string, readOnly bool) (bleve.Index, error) {
 	if readOnly {
-		// Read-only opens never create; if the writer hasn't materialized
-		// the index yet the reader returns the existence error, and the
-		// caller can retry Reload later.
 		idx, err := bleve.OpenUsing(path, map[string]interface{}{"read_only": true})
 		if err != nil {
 			return nil, fmt.Errorf("open bleve index read-only at %s: %w", path, err)
@@ -97,6 +123,43 @@ func openIndex(path string, readOnly bool) (bleve.Index, error) {
 		return nil, fmt.Errorf("open bleve index at %s: %w", path, err)
 	}
 	return idx, nil
+}
+
+// openIndexTimed runs openIndex in a goroutine and returns
+// ErrOpenTimedOut if the call doesn't finish before the deadline.
+//
+// Caveat: a timed-out goroutine is leaked — it stays parked inside
+// bbolt's flock syscall until the kernel hands the lock over (which
+// may be never if the writer never exits). The leaked goroutine
+// holds nothing else; once it eventually returns, the open Bleve
+// handle is closed and discarded. We accept the leak because the
+// alternative (forking Bleve to plumb a timeout into bbolt.Options)
+// is far more invasive.
+func openIndexTimed(path string, readOnly bool, deadline time.Duration) (bleve.Index, error) {
+	type result struct {
+		idx bleve.Index
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		idx, err := openIndex(path, readOnly)
+		select {
+		case ch <- result{idx, err}:
+		default:
+			// Caller already gave up. Discard the handle so we don't
+			// leave a stale Bleve open in our own process.
+			if idx != nil {
+				_ = idx.Close()
+			}
+		}
+	}()
+
+	select {
+	case r := <-ch:
+		return r.idx, r.err
+	case <-time.After(deadline):
+		return nil, ErrOpenTimedOut
+	}
 }
 
 // Reload closes and reopens the index. Read-only callers use this to
@@ -117,6 +180,29 @@ func (s *Store) Reload() error {
 	if old != nil {
 		_ = old.Close()
 	}
+	return nil
+}
+
+// Promote switches a read-only Store to writable in place. Caller is
+// responsible for already holding the writer flock (the orchestration
+// is in cmd/paprika-3-mcp/main.go's reader→writer promotion path).
+// After Promote returns nil, Upsert/Delete succeed and Reload() is no
+// longer valid. Idempotent if already a writer.
+func (s *Store) Promote() error {
+	s.idxMu.Lock()
+	defer s.idxMu.Unlock()
+	if !s.readOnly {
+		return nil
+	}
+	if err := s.idx.Close(); err != nil {
+		return fmt.Errorf("close read-only index before promote: %w", err)
+	}
+	fresh, err := openIndex(s.path, false)
+	if err != nil {
+		return fmt.Errorf("reopen index writable for promote: %w", err)
+	}
+	s.idx = fresh
+	s.readOnly = false
 	return nil
 }
 

@@ -128,18 +128,27 @@ func main() {
 	rootCtx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	syncerOpts := syncer.Options{
+		Client: client,
+		Store:  st,
+		Logger: logger,
+	}
 	var sync *syncer.Syncer
 	if role == "writer" {
-		sync = syncer.New(syncer.Options{
-			Client: client,
-			Store:  st,
-			Logger: logger,
-		})
+		sync = syncer.New(syncerOpts)
 		go sync.Run(rootCtx)
 		// Held until process exit; OS releases on death.
 		defer writerLock.Close()
 	} else {
-		go runReaderReloader(rootCtx, st, *readerReopenInterval, logger)
+		// Reader: poll the lock so we can take over if the original
+		// writer dies, otherwise just refresh the in-memory index.
+		go runReaderLoop(rootCtx, readerLoopOpts{
+			Store:        st,
+			LockPath:     lockPath,
+			Interval:     *readerReopenInterval,
+			Logger:       logger,
+			SyncerOpts:   syncerOpts,
+		})
 	}
 
 	srv, err := mcpserver.NewServer(mcpserver.NewServerOptions{
@@ -161,45 +170,93 @@ func main() {
 	}
 }
 
-// openStoreWithRetry handles the cold-start race: if a reader spawns
-// before the writer has materialized the index, the read-only Open
-// fails with "index does not exist". Retry briefly so the reader
-// catches up rather than crashing — but stay well within an MCP
-// handshake window (50 × 100ms = 5s budget).
+// openStoreWithRetry handles two flavors of read-only race:
+//   1. The writer hasn't created the index yet — quick retries pick it
+//      up as soon as the writable Open finishes the initial materialize.
+//   2. The writer is busy holding bbolt's exclusive lock and the read-
+//      only open would block forever. store.Open returns
+//      ErrOpenTimedOut for this case (per-attempt 2s here so we get a
+//      handful of retries inside the MCP handshake window).
+//
+// Writers don't retry — Open creates the directory and never has to
+// wait on another holder of the file.
 func openStoreWithRetry(path string, readOnly bool, logger *slog.Logger) (*store.Store, error) {
-	const maxAttempts = 50
-	const interval = 100 * time.Millisecond
+	if !readOnly {
+		return store.Open(store.Options{Path: path, ReadOnly: false, Logger: logger})
+	}
+
+	// 4 attempts × ~2s open + 250ms sleep ≈ 9s wall-clock max.
+	const maxAttempts = 4
+	const interval = 250 * time.Millisecond
+	const perAttemptDeadline = 2 * time.Second
 	var lastErr error
 	for i := 0; i < maxAttempts; i++ {
-		st, err := store.Open(store.Options{Path: path, ReadOnly: readOnly, Logger: logger})
+		st, err := store.Open(store.Options{
+			Path:        path,
+			ReadOnly:    true,
+			OpenTimeout: perAttemptDeadline,
+			Logger:      logger,
+		})
 		if err == nil {
 			return st, nil
 		}
 		lastErr = err
-		if !readOnly {
-			// Writers don't retry — Open creates the directory if missing.
-			return nil, err
-		}
-		logger.Debug("reader waiting for writer to create index", "err", err, "attempt", i+1)
+		logger.Debug("reader open failed; retrying", "err", err, "attempt", i+1)
 		time.Sleep(interval)
 	}
-	return nil, fmt.Errorf("waiting for writer-created index: %w", lastErr)
+	return nil, fmt.Errorf("read-only open after %d attempts: %w", maxAttempts, lastErr)
 }
 
-// runReaderReloader periodically calls store.Reload() so the reader
-// process picks up commits the writer has flushed to disk. Bleve has
-// no inotify-style mechanism for cross-process change notifications,
-// so polling is the simplest correct option.
-func runReaderReloader(ctx context.Context, st *store.Store, every time.Duration, logger *slog.Logger) {
-	t := time.NewTicker(every)
+type readerLoopOpts struct {
+	Store      *store.Store
+	LockPath   string
+	Interval   time.Duration
+	Logger     *slog.Logger
+	SyncerOpts syncer.Options
+}
+
+// runReaderLoop is the reader's background goroutine. On each tick it:
+//  1. Tries to acquire the writer flock — if the previous writer died
+//     (or was never around), this reader promotes itself to writer,
+//     reopens the index writable, kicks off the syncer, and exits the
+//     loop holding the lock for the rest of the process lifetime.
+//  2. Otherwise, calls store.Reload() so the in-memory index picks up
+//     commits the current writer has flushed to disk.
+//
+// Promotion is a permanent state change (sticky); a process never
+// demotes back to reader. The flock fd lives in the goroutine so the
+// kernel releases it on process death.
+func runReaderLoop(ctx context.Context, opts readerLoopOpts) {
+	t := time.NewTicker(opts.Interval)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if err := st.Reload(); err != nil {
-				logger.Warn("reader reload failed", "err", err)
+			lock, err := store.TryLock(opts.LockPath)
+			switch {
+			case err == nil:
+				opts.Logger.Info("writer lock acquired by reader; promoting", "lock", opts.LockPath)
+				if perr := opts.Store.Promote(); perr != nil {
+					opts.Logger.Error("promote store failed; staying reader", "err", perr)
+					_ = lock.Close()
+					goto reload
+				}
+				// Lock is intentionally not closed here — held for
+				// the rest of the process lifetime via the closure.
+				_ = lock // keep reference alive
+				opts.Logger.Info("promoted reader to writer; starting syncer")
+				go syncer.New(opts.SyncerOpts).Run(ctx)
+				return
+			case errors.Is(err, store.ErrLockHeld):
+				// Expected: a different process is the writer.
+			default:
+				opts.Logger.Warn("writer-lock probe failed; will retry", "err", err)
+			}
+		reload:
+			if err := opts.Store.Reload(); err != nil {
+				opts.Logger.Warn("reader reload failed", "err", err)
 			}
 		}
 	}

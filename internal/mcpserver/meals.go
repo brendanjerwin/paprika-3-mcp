@@ -119,14 +119,11 @@ func (s *Server) handleAddMeal(ctx context.Context, req mcp.CallToolRequest) (*m
 		}
 	}
 
-	// If recipe_uid is given but no name, use the recipe's name as the
-	// freeform display label so older clients that don't dereference
-	// recipe_uid still show something useful.
-	if recipeUID != "" && name == "" {
-		if r, err := s.store.Get(recipeUID); err == nil && r != nil {
-			name = r.Name
-		}
-	}
+	// We deliberately do NOT auto-populate `name` from the recipe's
+	// title when only recipe_uid is given. Paprika's app dereferences
+	// recipe_uid for display in modern clients; the freeform `name`
+	// field is for "leftovers" / non-recipe entries. Auto-populating
+	// would put the recipe title in two places and risk drift.
 
 	plan := paprika.MealPlan{
 		RecipeUID: recipeUID,
@@ -225,34 +222,39 @@ func (s *Server) handleAddGrocery(ctx context.Context, req mcp.CallToolRequest) 
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 	listUID := req.GetString("list_uid", "")
+
+	// Always fetch the lists collection so we can either resolve the
+	// default OR validate a caller-supplied list_uid. Paprika's API
+	// silently accepts unknown list_uids (the row just becomes invisible
+	// in the app), so we have to enforce membership here.
+	lists, err := s.paprika3.ListGroceryLists(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("look up grocery lists: %w", err)
+	}
+	known := map[string]bool{}
+	var defaultUID, firstUID string
+	for _, l := range lists.Result {
+		if l.Deleted {
+			continue
+		}
+		known[l.UID] = true
+		if firstUID == "" {
+			firstUID = l.UID
+		}
+		if l.IsDefault {
+			defaultUID = l.UID
+		}
+	}
 	if listUID == "" {
-		// Fall back to the user's default list. If none is marked
-		// default, the API will pick "the" list when there's only one.
-		lists, err := s.paprika3.ListGroceryLists(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("look up default grocery list: %w", err)
-		}
-		for _, l := range lists.Result {
-			if l.Deleted {
-				continue
-			}
-			if l.IsDefault {
-				listUID = l.UID
-				break
-			}
-		}
+		listUID = defaultUID
 		if listUID == "" {
-			// No default flagged — pick the first non-deleted list.
-			for _, l := range lists.Result {
-				if !l.Deleted {
-					listUID = l.UID
-					break
-				}
-			}
+			listUID = firstUID
 		}
 		if listUID == "" {
 			return mcp.NewToolResultError("no grocery lists available; create one in Paprika first"), nil
 		}
+	} else if !known[listUID] {
+		return mcp.NewToolResultError(fmt.Sprintf("unknown list_uid %q; call list_paprika_grocery_lists to see valid UIDs", listUID)), nil
 	}
 
 	item := paprika.GroceryItem{

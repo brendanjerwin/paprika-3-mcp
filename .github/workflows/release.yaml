@@ -1,10 +1,19 @@
-# Build and publish release artifacts when a v* tag is pushed.
+# Build and publish release artifacts when a v* tag is pushed,
+# or on demand via workflow_dispatch (the manual lever — needed
+# because GitHub gates fork tag-push triggers behind a UI activation
+# step that's easy to miss).
 name: Release
 
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing v* tag to release (e.g. v0.8.0).'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -16,7 +25,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # workflow_dispatch resolves to the chosen tag; push events
+          # already check out the pushed ref. Either way fetch full
+          # history so goreleaser can compute changelogs.
           fetch-depth: 0
+          ref: ${{ github.event.inputs.tag || github.ref }}
       - uses: actions/setup-go@v5
         with:
           go-version-file: 'go.mod'
