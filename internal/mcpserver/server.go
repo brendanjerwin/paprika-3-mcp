@@ -99,17 +99,63 @@ func (s *Server) registerTools() {
 		mcp.WithString("difficulty", mcp.Description("Difficulty (Easy/Medium/Hard)."), mcp.DefaultString("")),
 	)
 	updateTool := mcp.NewTool("update_paprika_recipe",
-		mcp.WithDescription("Update an existing recipe in Paprika 3 cloud sync (and the local index)."),
+		mcp.WithDescription("Update an existing recipe in Paprika 3 cloud sync (and the local index). Fields left blank/omitted are preserved from the existing recipe — only fields you pass non-empty are overwritten. Categories, photo, rating, etc. always persist."),
 		mcp.WithString("uid", mcp.Description("UID of the recipe to update."), mcp.Required()),
-		mcp.WithString("name", mcp.Description("Recipe name."), mcp.Required()),
-		mcp.WithString("ingredients", mcp.Description("Ingredients."), mcp.Required()),
-		mcp.WithString("directions", mcp.Description("Directions."), mcp.Required()),
-		mcp.WithString("description", mcp.Description("Description."), mcp.Required()),
-		mcp.WithString("notes", mcp.Description("Notes."), mcp.Required()),
-		mcp.WithString("servings", mcp.Description("Servings."), mcp.Required()),
-		mcp.WithString("prep_time", mcp.Description("Prep time."), mcp.Required()),
-		mcp.WithString("cook_time", mcp.Description("Cook time."), mcp.Required()),
-		mcp.WithString("difficulty", mcp.Description("Difficulty."), mcp.Required()),
+		mcp.WithString("name", mcp.Description("Recipe name. Empty = keep existing."), mcp.DefaultString("")),
+		mcp.WithString("ingredients", mcp.Description("Ingredients. Empty = keep existing."), mcp.DefaultString("")),
+		mcp.WithString("directions", mcp.Description("Directions. Empty = keep existing."), mcp.DefaultString("")),
+		mcp.WithString("description", mcp.Description("Description. Empty = keep existing."), mcp.DefaultString("")),
+		mcp.WithString("notes", mcp.Description("Notes. Empty = keep existing."), mcp.DefaultString("")),
+		mcp.WithString("servings", mcp.Description("Servings. Empty = keep existing."), mcp.DefaultString("")),
+		mcp.WithString("prep_time", mcp.Description("Prep time. Empty = keep existing."), mcp.DefaultString("")),
+		mcp.WithString("cook_time", mcp.Description("Cook time. Empty = keep existing."), mcp.DefaultString("")),
+		mcp.WithString("difficulty", mcp.Description("Difficulty. Empty = keep existing."), mcp.DefaultString("")),
+		mcp.WithString("source", mcp.Description("Source/attribution. Empty = keep existing."), mcp.DefaultString("")),
+		mcp.WithString("source_url", mcp.Description("Source URL. Empty = keep existing."), mcp.DefaultString("")),
+	)
+
+	listMealsTool := mcp.NewTool("list_paprika_meals",
+		mcp.WithDescription("List meal-plan entries on the user's Paprika calendar. Optionally filter to a date range. Each entry links a recipe (or freeform name) to a date and meal slot."),
+		mcp.WithString("from_date", mcp.Description("Inclusive start date in YYYY-MM-DD. If omitted, no lower bound.")),
+		mcp.WithString("to_date", mcp.Description("Inclusive end date in YYYY-MM-DD. If omitted, no upper bound.")),
+		mcp.WithBoolean("include_deleted", mcp.Description("Include soft-deleted entries (default false).")),
+	)
+	addMealTool := mcp.NewTool("add_paprika_meal",
+		mcp.WithDescription("Add a recipe or freeform meal to the Paprika meal-plan calendar. The entry shows up in every family member's mobile app on next sync."),
+		mcp.WithString("date", mcp.Description("Date in YYYY-MM-DD."), mcp.Required()),
+		mcp.WithString("meal_type", mcp.Description("Meal type name as it appears in Paprika (\"Breakfast\", \"Dinner\", \"Brendan's Lunch\", ...). Resolved to a type UID via list_paprika_meal_types. Defaults to \"Dinner\" if omitted.")),
+		mcp.WithString("type_uid", mcp.Description("Override: pass the explicit type_uid instead of meal_type. Mutually exclusive with meal_type.")),
+		mcp.WithString("recipe_uid", mcp.Description("UID of an existing recipe. Use either recipe_uid OR name.")),
+		mcp.WithString("name", mcp.Description("Freeform meal name (used when no recipe is associated).")),
+	)
+	removeMealTool := mcp.NewTool("remove_paprika_meal",
+		mcp.WithDescription("Remove a meal-plan entry by UID (soft-delete; the entry disappears from clients on next sync)."),
+		mcp.WithString("uid", mcp.Description("Meal-plan entry UID."), mcp.Required()),
+	)
+	listMealTypesTool := mcp.NewTool("list_paprika_meal_types",
+		mcp.WithDescription("List the user's configured meal types (Breakfast, Lunch, Dinner, ...). Each meal-plan entry references one of these by integer Type."),
+	)
+
+	listGroceriesTool := mcp.NewTool("list_paprika_groceries",
+		mcp.WithDescription("List grocery rows. Optionally filter to a single grocery list, exclude purchased items, or hide soft-deleted rows."),
+		mcp.WithString("list_uid", mcp.Description("Restrict to a specific grocery list (UID from list_paprika_grocery_lists).")),
+		mcp.WithBoolean("only_unpurchased", mcp.Description("If true, drop purchased rows. Default false.")),
+		mcp.WithBoolean("include_deleted", mcp.Description("Include soft-deleted rows (default false).")),
+	)
+	addGroceryTool := mcp.NewTool("add_paprika_grocery_item",
+		mcp.WithDescription("Add an item to a grocery list. If list_uid is omitted the user's default list is used."),
+		mcp.WithString("name", mcp.Description("Item description (e.g. \"2 cups dried pinto beans\")."), mcp.Required()),
+		mcp.WithString("list_uid", mcp.Description("Target grocery list UID; defaults to the user's default list.")),
+		mcp.WithString("aisle", mcp.Description("Optional aisle/category label.")),
+		mcp.WithString("recipe_uid", mcp.Description("Optional recipe linkage (the recipe whose ingredients produced this row).")),
+		mcp.WithString("quantity", mcp.Description("Optional quantity string.")),
+	)
+	removeGroceryTool := mcp.NewTool("remove_paprika_grocery_item",
+		mcp.WithDescription("Remove a grocery row by UID (soft-delete)."),
+		mcp.WithString("uid", mcp.Description("Grocery row UID."), mcp.Required()),
+	)
+	listGroceryListsTool := mcp.NewTool("list_paprika_grocery_lists",
+		mcp.WithDescription("List the user's named grocery lists."),
 	)
 
 	s.server.AddTools(
@@ -117,6 +163,14 @@ func (s *Server) registerTools() {
 		server.ServerTool{Tool: getTool, Handler: s.handleGet},
 		server.ServerTool{Tool: createTool, Handler: s.handleCreate},
 		server.ServerTool{Tool: updateTool, Handler: s.handleUpdate},
+		server.ServerTool{Tool: listMealsTool, Handler: s.handleListMeals},
+		server.ServerTool{Tool: addMealTool, Handler: s.handleAddMeal},
+		server.ServerTool{Tool: removeMealTool, Handler: s.handleRemoveMeal},
+		server.ServerTool{Tool: listMealTypesTool, Handler: s.handleListMealTypes},
+		server.ServerTool{Tool: listGroceriesTool, Handler: s.handleListGroceries},
+		server.ServerTool{Tool: addGroceryTool, Handler: s.handleAddGrocery},
+		server.ServerTool{Tool: removeGroceryTool, Handler: s.handleRemoveGrocery},
+		server.ServerTool{Tool: listGroceryListsTool, Handler: s.handleListGroceryLists},
 	)
 }
 

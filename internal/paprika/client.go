@@ -53,15 +53,18 @@ func NewClient(username, password, version string, logger *slog.Logger) (*Client
 			}
 			return d.DialContext(ctx, network, addr)
 		},
-		ResponseHeaderTimeout: 10 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
+	// Paprika's login endpoint can take 20-30s under load (observed
+	// 2026-04-29). The rest of the API is faster, but we set the same
+	// generous default so the syncer's bigger fetches don't fight us.
 	client := &http.Client{
 		Transport: t,
-		Timeout:   10 * time.Second,
+		Timeout:   60 * time.Second,
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	token, err := login(ctx, *client, username, password)
 	if err != nil {
