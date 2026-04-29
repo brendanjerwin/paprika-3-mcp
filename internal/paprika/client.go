@@ -514,6 +514,18 @@ func (c *Client) DeleteRecipe(ctx context.Context, recipe Recipe) (*Recipe, erro
 // SaveRecipe saves a recipe to the Paprika API. If the recipe already exists, it will be updated.
 // If the recipe does not exist, it will be created.
 func (c *Client) SaveRecipe(ctx context.Context, recipe Recipe) (*Recipe, error) {
+	// Paprika's mobile-app sync rejects records with `"categories":null`
+	// — it surfaces as the "Value cannot be null. Parameter name:
+	// collection." error in the iOS/Android app and blocks all further
+	// sync until the bad record is fixed. The cloud's create endpoint
+	// accepts the null and only barfs on subsequent client pulls, which
+	// is why this didn't show up in earlier smoke tests. JSON-marshalling
+	// a nil []string produces null; an empty slice produces [], which is
+	// what the API actually wants. Default it here so every save path
+	// (create, update, our merge-on-update) is safe.
+	if recipe.Categories == nil {
+		recipe.Categories = []string{}
+	}
 	// set the created timestamp
 	recipe.updateCreated()
 	// generate a new UUID if one doesn't exist
