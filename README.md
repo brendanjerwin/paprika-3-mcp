@@ -1,130 +1,70 @@
-# paprika-3-mcp
+# paprika-3-mcp (brendanjerwin fork)
 
-A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/introduction) server that exposes your **Paprika 3** recipes as LLM-readable resources — and lets an LLM like Claude create or update recipes in your Paprika app.
+A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/introduction) server that exposes your **Paprika 3** recipes to LLM clients — with high-quality local search.
 
-### 🖼️ Example: Claude using the Paprika MCP server
+> Forked from [soggycactus/paprika-3-mcp](https://github.com/soggycactus/paprika-3-mcp). Adds a local Bleve search index, a `search_paprika_recipes` tool, env-var credentials, and a sync loop that uses Paprika's `/sync/status` counter as a delta probe before listing.
 
-<p align="center">
-  <img src="docs/example.png" alt="MCP server running with Claude" />
-</p>
+## 🚀 What's different in this fork
 
-## 🚀 Features
+- **`search_paprika_recipes`** — Bleve full-text query string syntax with English stemming, fielded queries (`name:chili`), phrases, boolean operators, fuzziness, plus `limit` / `min_rating` / `category` filters. Returns ranked hits with highlighted snippets.
+- **`get_paprika_recipe`** — fetch a single recipe from the local index by UID.
+- **Local Bleve index** at `$XDG_STATE_HOME/paprika-3-mcp/recipes.bleve` (defaults to `~/.local/state/paprika-3-mcp/`). Source of truth for search and resource reads; rebuilt automatically on first run.
+- **Background sync loop** that calls `/api/v2/sync/status/` first and skips the (more expensive) full recipe-list diff when the global `recipes` counter hasn't moved. Forces a deep diff every hour as a safety net.
+- **Credentials via `PAPRIKA_USERNAME` / `PAPRIKA_PASSWORD` environment variables** — passing them on the command line is no longer supported because the password ended up visible in `ps`.
+- **Logs to stderr** instead of `/var/log/paprika-3-mcp/server.log` (which silently failed for non-root users on Linux).
 
-See anything missing? Open an issue on this repo to request a feature!
-
-#### 📄 **Resources**
-
-- Recipes ✅
-- Recipe Photos 🚧
-
-#### 🛠 **Tools**
-
-- `create_paprika_recipe`  
-  Allows Claude to save a new recipe to your Paprika app
-- `update_paprika_recipe`  
-  Allows Claude to modify an existing recipe
-
-## ⚙️ Prerequisites
-
-- ✅ A Mac, Linux, or Windows system
-- ✅ [Paprika 3](https://www.paprikaapp.com/) installed with cloud sync enabled
-- ✅ Your Paprika 3 **username and password**
-- ✅ Claude or any LLM client with **MCP tool support** enabled
+The original tools (`create_paprika_recipe`, `update_paprika_recipe`) still exist; they now write through to the local index immediately.
 
 ## 🛠 Installation
 
-You can download a prebuilt binary from the [Releases](https://github.com/soggycactus/paprika-3-mcp/releases) page.
-
-### 🍎 macOS (via Homebrew)
-
-If you're on macOS, the easiest way to install is with [Homebrew](https://brew.sh/):
+Download a prebuilt binary from the [Releases](https://github.com/brendanjerwin/paprika-3-mcp/releases) page, or build from source with `go build ./cmd/paprika-3-mcp`.
 
 ```bash
-brew tap soggycactus/tap
-brew install paprika-3-mcp
-```
-
-### 🐧 Linux / 🪟 Windows
-
-1. Go to the [latest release](https://github.com/soggycactus/paprika-3-mcp/releases).
-2. Download the appropriate archive for your operating system and architecture:
-   - `paprika-3-mcp_<version>_linux_amd64.zip` for Linux
-   - `paprika-3-mcp_<version>_windows_amd64.zip` for Windows
-3. Extract the zip archive:
-   - **Linux**:
-     ```bash
-     unzip paprika-3-mcp_<version>_<os>_<arch>.zip
-     ```
-   - **Windows**:
-     - Right-click the `.zip` file and select **Extract All**, or use a tool like 7-Zip.
-4. Move the binary to a directory in your system's `$PATH`:
-
-   - Linux:
-
-     ```bash
-     sudo mv paprika-3-mcp /usr/local/bin/
-     ```
-
-   - Windows:
-     - Move `paprika-3-mcp.exe` to any folder in your `PATH` (e.g., `%USERPROFILE%\bin`)
-
-### ✅ Test the installation
-
-You can verify the server is installed by checking:
-
-```bash
+unzip paprika-3-mcp_<version>_linux_amd64.zip
+sudo mv paprika-3-mcp /usr/local/bin/
 paprika-3-mcp --version
 ```
 
-You should see:
-
-```bash
-paprika-3-mcp version v0.1.0
-```
-
-## 🤖 Setting up Claude
-
-If you haven't setup MCP before, [first read more about how to install Claude Desktop client & configure an MCP server.](https://modelcontextprotocol.io/quickstart/user)
-
-To add `paprika-3-mcp` to Claude, all you need to do is create another entry in the `mcpServers` section of your `claude_desktop_config.json` file:
+## 🤖 Configuration
 
 ```json
 {
   "mcpServers": {
     "paprika-3": {
-      "command": "paprika-3-mcp",
-      "args": [
-        "--username",
-        "<your paprika 3 username (usually email)>",
-        "--password",
-        "<your paprika 3 password>"
-      ]
+      "command": "/usr/local/bin/paprika-3-mcp",
+      "env": {
+        "PAPRIKA_USERNAME": "<your paprika 3 email>",
+        "PAPRIKA_PASSWORD": "<your paprika 3 password>"
+      }
     }
   }
 }
 ```
 
-Restart Claude and you should see the MCP server tools after clicking on the hammerhead icon:
+Most agent harnesses prefer to inject `env` from a secret store rather than embedding it in the JSON; do that. The previous `--username` / `--password` mode was removed.
 
-![MCP server running with Claude](docs/install.png)
+### Flags
+
+| Flag | Default | Notes |
+|------|---------|-------|
+| `--data-dir` | `$XDG_STATE_HOME/paprika-3-mcp` (or `~/.local/state/paprika-3-mcp`) | Where the Bleve index lives. |
+| `--log-level` | `info` | `debug`, `info`, `warn`, `error`. |
+| `--version` | — | Print version and exit. |
+
+### Search query syntax
+
+Bleve query-string syntax. Some examples:
+
+```text
+pinto bean                 # any of the terms (OR), stemmed
+"smoked paprika"           # exact phrase (still stemmed)
+name:chili                 # fielded
+ingredients:tahini -beef   # required + must-not-have
+paprika~                   # fuzzy
+```
+
+Filters (passed as separate arguments, not in the query string): `min_rating: 4`, `category: "Mexican"`.
 
 ## 📄 License
 
-This project is open source under the [MIT License](./LICENSE) © 2025 [Lucas Stephens](https://github.com/soggycactus).
-
----
-
-#### 🗂 Miscellaneous
-
-##### 📄 Where can I see the server logs?
-
-The MCP server writes structured logs using Go’s `slog` with rotation via `lumberjack`. Log files are automatically created based on your operating system:
-
-| Operating System | Log File Path                             |
-| ---------------- | ----------------------------------------- |
-| macOS            | `~/Library/Logs/paprika-3-mcp/server.log` |
-| Linux            | `/var/log/paprika-3-mcp/server.log`       |
-| Windows          | `%APPDATA%\paprika-3-mcp\server.log`      |
-| Other / Unknown  | `/tmp/paprika-3-mcp/server.log`           |
-
-> 💡 Logs are rotated automatically at 100MB, with only 5 backup files kept. Logs are also wiped after 10 days.
+MIT © 2025 [Lucas Stephens](https://github.com/soggycactus). Fork additions © 2026 Brendan Erwin.

@@ -47,19 +47,4 @@ changelog:
       - '^test:'
       - '^chore:'
 
-brews:
-  - name: paprika-3-mcp
-    repository:
-      owner: soggycactus
-      name: homebrew-tap
-    homepage: https://github.com/soggycactus/paprika-3-mcp
-    description: MCP Server for creating/editing recipes in Paprika 3 with natural language 
-    license: MIT
-    directory: Formula
-    test: |
-      system "#{bin}/paprika-3-mcp", "--version"
-    install: |
-      bin.install "paprika-3-mcp"
-    commit_author:
-      name: Lucas Stephens
-      email: lucas@lucastephens.com
+# Homebrew tap publishing removed in this fork — release flow is GitHub Releases only.

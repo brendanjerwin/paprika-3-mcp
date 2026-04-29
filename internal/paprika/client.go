@@ -151,6 +151,62 @@ type RecipeList struct {
 	} `json:"result"`
 }
 
+// SyncStatus is the response from /api/v2/sync/status/. The counters
+// monotonically increase on each create/update/soft-delete in the
+// matching collection, so the syncer uses the `recipes` counter as a
+// cheap "did anything change?" probe before fetching the full list.
+//
+// Paprika doesn't publish API docs; field set is reverse-engineered from
+// observation. New collections show up over time, so we keep the struct
+// open by also unmarshalling into a generic map for forward compatibility.
+type SyncStatus struct {
+	Recipes           int `json:"recipes"`
+	Categories        int `json:"categories"`
+	Photos            int `json:"photos"`
+	Groceries         int `json:"groceries"`
+	GroceryLists      int `json:"grocerylists"`
+	GroceryAisles     int `json:"groceryaisles"`
+	GroceryIngredients int `json:"groceryingredients"`
+	Meals             int `json:"meals"`
+	MealTypes         int `json:"mealtypes"`
+	Bookmarks         int `json:"bookmarks"`
+	Pantry            int `json:"pantry"`
+	PantryLocations   int `json:"pantrylocations"`
+	Menus             int `json:"menus"`
+	MenuItems         int `json:"menuitems"`
+}
+
+type syncStatusResponse struct {
+	Result SyncStatus `json:"result"`
+}
+
+// GetSyncStatus fetches /api/v2/sync/status/. Used as a delta probe:
+// if the `Recipes` counter is unchanged since the last successful poll,
+// the syncer can skip listing recipes entirely.
+func (c *Client) GetSyncStatus(ctx context.Context) (*SyncStatus, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://paprikaapp.com/api/v2/sync/status/", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to get sync status: %s", resp.Status)
+	}
+	rawBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var sr syncStatusResponse
+	if err := json.Unmarshal(rawBytes, &sr); err != nil {
+		return nil, err
+	}
+	return &sr.Result, nil
+}
+
 // ListRecipes retrieves a list of recipes from the Paprika API - the response objects
 // only contain the UID and hash of each recipe, not the full recipe object
 func (c *Client) ListRecipes(ctx context.Context) (*RecipeList, error) {

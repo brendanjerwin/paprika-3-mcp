@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/soggycactus/paprika-3-mcp/internal/paprika"
+	"github.com/brendanjerwin/paprika-3-mcp/internal/paprika"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -16,6 +16,9 @@ import (
 func TestClient(t *testing.T) {
 	username := os.Getenv("PAPRIKA_USERNAME")
 	password := os.Getenv("PAPRIKA_PASSWORD")
+	if username == "" || password == "" {
+		t.Skip("PAPRIKA_USERNAME/PAPRIKA_PASSWORD not set; skipping live API integration test")
+	}
 	client, err := paprika.NewClient(username, password, "dev", nil)
 	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
