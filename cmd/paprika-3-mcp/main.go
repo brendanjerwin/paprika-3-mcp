@@ -68,9 +68,12 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 	logger.Info("paprika-3-mcp starting", "version", version, "data_dir", *dataDir)
 
+	// NewClient no longer logs in synchronously — the actual auth
+	// round-trip happens on first authenticated request, so the MCP
+	// server can answer the `initialize` handshake before that lands.
 	client, err := paprika.NewClient(username, password, version, logger)
 	if err != nil {
-		logger.Error("paprika login failed", "err", err)
+		logger.Error("paprika client init failed", "err", err)
 		os.Exit(1)
 	}
 

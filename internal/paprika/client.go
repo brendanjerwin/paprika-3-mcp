@@ -17,34 +17,26 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 )
 
-// roundTripper is a wrapper around http.RoundTripper
-// that adds the specified headers to each request
-type roundTripper struct {
-	headers   map[string]string
-	transport http.RoundTripper
-}
-
-func (r *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	for k, v := range r.headers {
-		// Only set if not already present
-		if req.Header.Get(k) == "" {
-			req.Header.Set(k, v)
-		}
-	}
-	return r.transport.RoundTrip(req)
-}
-
 func userAgent(version string) string {
 	return fmt.Sprintf("paprika-3-mcp/%s (golang; %s)", version, runtime.Version())
 }
 
+// NewClient builds a client that does NOT log in eagerly. The bearer
+// token is fetched lazily on the first authenticated request (and
+// cached thereafter), so callers can construct the client without
+// blocking on Paprika's slow login endpoint. Without this, an MCP
+// stdio server can't respond to the initial `initialize` handshake
+// before the host gives up.
 func NewClient(username, password, version string, logger *slog.Logger) (*Client, error) {
-	// Create the http client & login to retrieve an authentication token
+	if logger == nil {
+		logger = slog.Default()
+	}
 	t := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			d := &net.Dialer{
@@ -53,48 +45,88 @@ func NewClient(username, password, version string, logger *slog.Logger) (*Client
 			}
 			return d.DialContext(ctx, network, addr)
 		},
+		// Paprika's login endpoint can take 20-30s under load (observed
+		// 2026-04-29). Generous header timeout so our requests don't
+		// die before the server starts replying.
 		ResponseHeaderTimeout: 60 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
-	// Paprika's login endpoint can take 20-30s under load (observed
-	// 2026-04-29). The rest of the API is faster, but we set the same
-	// generous default so the syncer's bigger fetches don't fight us.
-	client := &http.Client{
-		Transport: t,
+
+	c := &Client{
+		underlying: t,
+		logger:     logger,
+		username:   username,
+		password:   password,
+		version:    version,
+	}
+
+	c.client = &http.Client{
+		Transport: &authTransport{c: c, inner: t},
 		Timeout:   60 * time.Second,
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	token, err := login(ctx, *client, username, password)
-	if err != nil {
-		return nil, fmt.Errorf("failed to login: %w", err)
-	}
-
-	client.Transport = &roundTripper{
-		transport: t,
-		headers: map[string]string{
-			"Accept":        "*/*",
-			"Authorization": fmt.Sprintf("Bearer %s", token),
-			"Connection":    "keep-alive",
-			"User-Agent":    userAgent(version),
-		},
-	}
-
-	l := logger
-	if l == nil {
-		l = slog.Default()
-	}
-
-	return &Client{
-		client: client,
-		logger: l,
-	}, nil
+	return c, nil
 }
 
 type Client struct {
-	client *http.Client
-	logger *slog.Logger
+	client     *http.Client
+	underlying http.RoundTripper
+	logger     *slog.Logger
+
+	username string
+	password string
+	version  string
+
+	tokenMu sync.Mutex
+	token   string
+}
+
+// ensureToken returns the bearer token, performing the login round-trip
+// the first time it's called. Subsequent calls return the cached value.
+// Callers reach this through authTransport.RoundTrip, which is invoked
+// on every authenticated request.
+func (c *Client) ensureToken(ctx context.Context) (string, error) {
+	c.tokenMu.Lock()
+	defer c.tokenMu.Unlock()
+	if c.token != "" {
+		return c.token, nil
+	}
+	plain := http.Client{Transport: c.underlying, Timeout: 60 * time.Second}
+	tok, err := login(ctx, plain, c.username, c.password)
+	if err != nil {
+		return "", err
+	}
+	c.token = tok
+	c.logger.Info("paprika login succeeded")
+	return tok, nil
+}
+
+// authTransport is the round-tripper installed on Client.client. It
+// resolves the bearer token (lazily logging in on first use) and adds
+// Paprika's standard headers to every outgoing request.
+type authTransport struct {
+	c     *Client
+	inner http.RoundTripper
+}
+
+func (a *authTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	tok, err := a.c.ensureToken(req.Context())
+	if err != nil {
+		return nil, err
+	}
+	if req.Header.Get("Authorization") == "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	if req.Header.Get("User-Agent") == "" {
+		req.Header.Set("User-Agent", userAgent(a.c.version))
+	}
+	if req.Header.Get("Accept") == "" {
+		req.Header.Set("Accept", "*/*")
+	}
+	if req.Header.Get("Connection") == "" {
+		req.Header.Set("Connection", "keep-alive")
+	}
+	return a.inner.RoundTrip(req)
 }
 
 type loginResponse struct {
