@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -143,12 +144,12 @@ func (s *Server) registerTools() {
 		mcp.WithBoolean("include_deleted", mcp.Description("Include soft-deleted rows (default false).")),
 	)
 	addGroceryTool := mcp.NewTool("add_paprika_grocery_item",
-		mcp.WithDescription("Add an item to a grocery list. If list_uid is omitted the user's default list is used."),
-		mcp.WithString("name", mcp.Description("Item description (e.g. \"2 cups dried pinto beans\")."), mcp.Required()),
+		mcp.WithDescription("Add an item to a grocery list. If list_uid is omitted the user's default list is used. Paprika's mobile app renders the `ingredient` field — that's what's required here. The internal `name` mirror is set automatically."),
+		mcp.WithString("ingredient", mcp.Description("What the Paprika app shows on the row (e.g. \"pinto beans\", \"olive oil\"). Required."), mcp.Required()),
 		mcp.WithString("list_uid", mcp.Description("Target grocery list UID; defaults to the user's default list.")),
-		mcp.WithString("aisle", mcp.Description("Optional aisle/category label.")),
+		mcp.WithString("aisle", mcp.Description("Aisle name (e.g. \"Dairy\", \"Produce\"). Resolved to the matching aisle_uid via list_paprika_grocery_aisles; unmatched names fall back to whatever Paprika auto-classifies, usually Miscellaneous.")),
+		mcp.WithString("quantity", mcp.Description("Optional quantity (e.g. \"2 cups\", \"1 lb\"). Free text.")),
 		mcp.WithString("recipe_uid", mcp.Description("Optional recipe linkage (the recipe whose ingredients produced this row).")),
-		mcp.WithString("quantity", mcp.Description("Optional quantity string.")),
 	)
 	removeGroceryTool := mcp.NewTool("remove_paprika_grocery_item",
 		mcp.WithDescription("Remove a grocery row by UID (soft-delete)."),
@@ -156,6 +157,9 @@ func (s *Server) registerTools() {
 	)
 	listGroceryListsTool := mcp.NewTool("list_paprika_grocery_lists",
 		mcp.WithDescription("List the user's named grocery lists."),
+	)
+	listGroceryAislesTool := mcp.NewTool("list_paprika_grocery_aisles",
+		mcp.WithDescription("List the user's configured grocery aisles (Produce, Dairy, ...). Add tools resolve the human-friendly name to the matching aisle_uid before sending the row to Paprika."),
 	)
 
 	s.server.AddTools(
@@ -171,6 +175,7 @@ func (s *Server) registerTools() {
 		server.ServerTool{Tool: addGroceryTool, Handler: s.handleAddGrocery},
 		server.ServerTool{Tool: removeGroceryTool, Handler: s.handleRemoveGrocery},
 		server.ServerTool{Tool: listGroceryListsTool, Handler: s.handleListGroceryLists},
+		server.ServerTool{Tool: listGroceryAislesTool, Handler: s.handleListGroceryAisles},
 	)
 }
 
@@ -224,16 +229,23 @@ type searchResponse struct {
 }
 
 func (s *Server) handleSearch(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	query, err := req.RequireString("query")
+	rawQuery, err := req.RequireString("query")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	query, err := requireNonBlank("query", rawQuery)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
+	limit, _ := boundInt(req.GetInt("limit", 10), 1, 100)
+	rating, _ := boundInt(req.GetInt("min_rating", 0), 0, 5)
+
 	opts := store.SearchOptions{
 		Query:     query,
-		Limit:     req.GetInt("limit", 0),
-		MinRating: req.GetInt("min_rating", 0),
-		Category:  req.GetString("category", ""),
+		Limit:     limit,
+		MinRating: rating,
+		Category:  strings.TrimSpace(req.GetString("category", "")),
 	}
 
 	hits, err := s.store.Search(opts)

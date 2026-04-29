@@ -88,6 +88,21 @@ type GroceryListResponse struct {
 	Result []GroceryList `json:"result"`
 }
 
+// GroceryAisle is a global aisle category (Produce, Dairy, ...). The
+// list is shared across grocery lists. Items reference aisles via
+// AisleUID (the free-text Aisle on a GroceryItem is mostly a display
+// hint; AisleUID is what determines categorization in the app).
+type GroceryAisle struct {
+	UID       string `json:"uid"`
+	Name      string `json:"name"`
+	OrderFlag int    `json:"order_flag"`
+	Deleted   bool   `json:"deleted"`
+}
+
+type GroceryAisleResponse struct {
+	Result []GroceryAisle `json:"result"`
+}
+
 // ListMealPlan returns every meal-plan entry. Paprika has no
 // date-range filter, so we pull everything and let the caller filter.
 func (c *Client) ListMealPlan(ctx context.Context) (*MealPlanResponse, error) {
@@ -142,6 +157,17 @@ func (c *Client) ListGroceries(ctx context.Context) (*GroceryResponse, error) {
 func (c *Client) ListGroceryLists(ctx context.Context) (*GroceryListResponse, error) {
 	var out GroceryListResponse
 	if err := c.getJSON(ctx, "https://paprikaapp.com/api/v3/sync/grocerylists", &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ListGroceryAisles returns the user's configured aisle categories.
+// Used to resolve human-friendly aisle names (e.g. "Dairy") to the
+// aisle_uid the app needs for categorization to stick.
+func (c *Client) ListGroceryAisles(ctx context.Context) (*GroceryAisleResponse, error) {
+	var out GroceryAisleResponse
+	if err := c.getJSON(ctx, "https://paprikaapp.com/api/v3/sync/groceryaisles", &out); err != nil {
 		return nil, err
 	}
 	return &out, nil

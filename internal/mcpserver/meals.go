@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 
@@ -80,27 +81,29 @@ func (s *Server) handleListMeals(ctx context.Context, req mcp.CallToolRequest) (
 }
 
 func (s *Server) handleAddMeal(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	date, err := req.RequireString("date")
+	dateStr, err := req.RequireString("date")
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	if !looksLikeISODate(date) {
-		return mcp.NewToolResultError("date must be YYYY-MM-DD"), nil
+	if _, err := validateDate(dateStr); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
 	}
-	recipeUID := req.GetString("recipe_uid", "")
-	name := req.GetString("name", "")
+
+	recipeUID := strings.TrimSpace(req.GetString("recipe_uid", ""))
+	name := strings.TrimSpace(req.GetString("name", ""))
 	if recipeUID == "" && name == "" {
 		return mcp.NewToolResultError("either recipe_uid or name is required"), nil
 	}
 
-	typeUID := req.GetString("type_uid", "")
-	mealTypeName := req.GetString("meal_type", "")
+	typeUID := strings.TrimSpace(req.GetString("type_uid", ""))
+	mealTypeName := strings.TrimSpace(req.GetString("meal_type", ""))
+	if typeUID != "" && mealTypeName != "" {
+		return mcp.NewToolResultError("pass meal_type OR type_uid, not both"), nil
+	}
 	if typeUID == "" {
 		if mealTypeName == "" {
 			mealTypeName = "Dinner"
 		}
-		// Resolve the meal-type name → UID via the API. We could cache
-		// these but the list is short and lookups are cheap.
 		mt, err := s.paprika3.ListMealTypes(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("look up meal types: %w", err)
@@ -119,23 +122,31 @@ func (s *Server) handleAddMeal(ctx context.Context, req mcp.CallToolRequest) (*m
 		}
 	}
 
-	// We deliberately do NOT auto-populate `name` from the recipe's
-	// title when only recipe_uid is given. Paprika's app dereferences
-	// recipe_uid for display in modern clients; the freeform `name`
-	// field is for "leftovers" / non-recipe entries. Auto-populating
-	// would put the recipe title in two places and risk drift.
+	// Verify recipe_uid actually points at a real recipe. Local index
+	// is the fast path; API GetRecipe is the fallback for recipes the
+	// reader hasn't synced yet.
+	if recipeUID != "" {
+		if r, _ := s.store.Get(recipeUID); r == nil {
+			fetchCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			fetched, ferr := s.paprika3.GetRecipe(fetchCtx, recipeUID)
+			cancel()
+			if ferr != nil || fetched == nil || fetched.UID == "" {
+				return mcp.NewToolResultError(fmt.Sprintf("recipe_uid %q not found; use search_paprika_recipes to find valid UIDs", recipeUID)), nil
+			}
+		}
+	}
 
 	plan := paprika.MealPlan{
 		RecipeUID: recipeUID,
 		Name:      name,
-		Date:      date + " 00:00:00",
+		Date:      dateStr + " 00:00:00",
 		TypeUID:   typeUID,
 	}
 	saved, err := s.paprika3.SaveMealPlan(ctx, plan)
 	if err != nil {
 		return nil, err
 	}
-	return mcp.NewToolResultText(fmt.Sprintf("Added meal %s on %s (uid=%s, type_uid=%s).", display(saved), date, saved.UID, saved.TypeUID)), nil
+	return mcp.NewToolResultText(fmt.Sprintf("Added meal %s on %s (uid=%s, type_uid=%s).", display(saved), dateStr, saved.UID, saved.TypeUID)), nil
 }
 
 func (s *Server) handleRemoveMeal(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -143,6 +154,33 @@ func (s *Server) handleRemoveMeal(ctx context.Context, req mcp.CallToolRequest) 
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	uid = strings.TrimSpace(uid)
+	if uid == "" {
+		return mcp.NewToolResultError("uid is required"), nil
+	}
+
+	// Confirm the meal exists and isn't already deleted before sending
+	// the soft-delete. Paprika silently accepts deletes for unknown UIDs.
+	plan, err := s.paprika3.ListMealPlan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("verify meal exists: %w", err)
+	}
+	var found bool
+	var alreadyDeleted bool
+	for _, m := range plan.Result {
+		if m.UID == uid {
+			found = true
+			alreadyDeleted = m.Deleted
+			break
+		}
+	}
+	if !found {
+		return mcp.NewToolResultError(fmt.Sprintf("meal %q not found", uid)), nil
+	}
+	if alreadyDeleted {
+		return mcp.NewToolResultText(fmt.Sprintf("meal %s was already soft-deleted; no-op", uid)), nil
+	}
+
 	if err := s.paprika3.DeleteMealPlan(ctx, uid); err != nil {
 		return nil, err
 	}
@@ -217,11 +255,16 @@ func (s *Server) handleListGroceries(ctx context.Context, req mcp.CallToolReques
 }
 
 func (s *Server) handleAddGrocery(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	name, err := req.RequireString("name")
+	ingredient, err := req.RequireString("ingredient")
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	listUID := req.GetString("list_uid", "")
+	ingredient, err = requireNonBlank("ingredient", ingredient)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	listUID := strings.TrimSpace(req.GetString("list_uid", ""))
 
 	// Always fetch the lists collection so we can either resolve the
 	// default OR validate a caller-supplied list_uid. Paprika's API
@@ -257,18 +300,63 @@ func (s *Server) handleAddGrocery(ctx context.Context, req mcp.CallToolRequest) 
 		return mcp.NewToolResultError(fmt.Sprintf("unknown list_uid %q; call list_paprika_grocery_lists to see valid UIDs", listUID)), nil
 	}
 
+	// Resolve the human-friendly aisle name to its UID. Paprika's app
+	// keys categorization off `aisle_uid`; the free-text `aisle` field
+	// is just a display hint and gets reclassified to "Miscellaneous"
+	// when the UID is empty.
+	aisleName := strings.TrimSpace(req.GetString("aisle", ""))
+	var aisleUID string
+	if aisleName != "" {
+		aisles, err := s.paprika3.ListGroceryAisles(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("look up grocery aisles: %w", err)
+		}
+		for _, a := range aisles.Result {
+			if a.Deleted {
+				continue
+			}
+			if strings.EqualFold(a.Name, aisleName) {
+				aisleUID = a.UID
+				aisleName = a.Name // canonicalize casing
+				break
+			}
+		}
+		if aisleUID == "" {
+			return mcp.NewToolResultError(fmt.Sprintf("aisle %q not found; call list_paprika_grocery_aisles to see options", aisleName)), nil
+		}
+	}
+
+	// Optional recipe_uid: validate against the local index, then API.
+	recipeUID := strings.TrimSpace(req.GetString("recipe_uid", ""))
+	if recipeUID != "" {
+		if r, _ := s.store.Get(recipeUID); r == nil {
+			fetchCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			fetched, ferr := s.paprika3.GetRecipe(fetchCtx, recipeUID)
+			cancel()
+			if ferr != nil || fetched == nil || fetched.UID == "" {
+				return mcp.NewToolResultError(fmt.Sprintf("recipe_uid %q not found", recipeUID)), nil
+			}
+		}
+	}
+
+	// Mirror `ingredient` to `name` so older Paprika clients that read
+	// `name` still display something sensible. The mobile app reads
+	// `ingredient`; this keeps both data-model fields in sync without
+	// inventing two separate inputs.
 	item := paprika.GroceryItem{
-		Name:      name,
-		ListUID:   listUID,
-		Aisle:     req.GetString("aisle", ""),
-		RecipeUID: req.GetString("recipe_uid", ""),
-		Quantity:  req.GetString("quantity", ""),
+		Name:       ingredient,
+		Ingredient: ingredient,
+		ListUID:    listUID,
+		Aisle:      aisleName,
+		AisleUID:   aisleUID,
+		RecipeUID:  recipeUID,
+		Quantity:   strings.TrimSpace(req.GetString("quantity", "")),
 	}
 	saved, err := s.paprika3.SaveGroceryItem(ctx, item)
 	if err != nil {
 		return nil, err
 	}
-	return mcp.NewToolResultText(fmt.Sprintf("Added grocery item %q (uid=%s) to list %s.", saved.Name, saved.UID, saved.ListUID)), nil
+	return mcp.NewToolResultText(fmt.Sprintf("Added grocery item %q (uid=%s) to list %s.", saved.Ingredient, saved.UID, saved.ListUID)), nil
 }
 
 func (s *Server) handleRemoveGrocery(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -276,10 +364,57 @@ func (s *Server) handleRemoveGrocery(ctx context.Context, req mcp.CallToolReques
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	uid = strings.TrimSpace(uid)
+	if uid == "" {
+		return mcp.NewToolResultError("uid is required"), nil
+	}
+
+	groc, err := s.paprika3.ListGroceries(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("verify grocery item exists: %w", err)
+	}
+	var found, alreadyDeleted bool
+	for _, g := range groc.Result {
+		if g.UID == uid {
+			found = true
+			alreadyDeleted = g.Deleted
+			break
+		}
+	}
+	if !found {
+		return mcp.NewToolResultError(fmt.Sprintf("grocery item %q not found", uid)), nil
+	}
+	if alreadyDeleted {
+		return mcp.NewToolResultText(fmt.Sprintf("grocery item %s was already soft-deleted; no-op", uid)), nil
+	}
+
 	if err := s.paprika3.DeleteGroceryItem(ctx, uid); err != nil {
 		return nil, err
 	}
 	return mcp.NewToolResultText(fmt.Sprintf("Soft-deleted grocery item %s.", uid)), nil
+}
+
+func (s *Server) handleListGroceryAisles(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	resp, err := s.paprika3.ListGroceryAisles(ctx)
+	if err != nil {
+		return nil, err
+	}
+	type row struct {
+		UID  string `json:"uid"`
+		Name string `json:"name"`
+	}
+	out := []row{}
+	for _, a := range resp.Result {
+		if a.Deleted {
+			continue
+		}
+		out = append(out, row{UID: a.UID, Name: a.Name})
+	}
+	body, err := json.MarshalIndent(out, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return mcp.NewToolResultText(string(body)), nil
 }
 
 func (s *Server) handleListGroceryLists(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -311,9 +446,9 @@ func (s *Server) handleListGroceryLists(ctx context.Context, _ mcp.CallToolReque
 
 // ----- helpers -----
 
-// looksLikeISODate is a permissive sanity check: 10 chars, dashes in the
-// right places, all-digit otherwise. No strict YYYY validation — we want
-// to bail on obvious typos, not enforce calendar validity.
+// looksLikeISODate is retained as a minimal cheap check for code paths
+// that don't need full calendar validation. Use validateDate (in
+// validate.go) anywhere a date is going to be sent to Paprika.
 func looksLikeISODate(s string) bool {
 	if len(s) != 10 || s[4] != '-' || s[7] != '-' {
 		return false
