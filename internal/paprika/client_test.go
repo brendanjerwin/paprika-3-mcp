@@ -19,7 +19,11 @@ func TestClient(t *testing.T) {
 	if username == "" || password == "" {
 		t.Skip("PAPRIKA_USERNAME/PAPRIKA_PASSWORD not set; skipping live API integration test")
 	}
-	client, err := paprika.NewClient(username, password, "dev", nil)
+	client, err := paprika.NewClient(paprika.ClientOptions{
+		Username: username,
+		Password: password,
+		Version:  "dev",
+	})
 	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()

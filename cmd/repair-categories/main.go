@@ -38,7 +38,12 @@ func main() {
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	client, err := paprika.NewClient(username, password, "repair", logger)
+	client, err := paprika.NewClient(paprika.ClientOptions{
+		Username: username,
+		Password: password,
+		Version:  "repair",
+		Logger:   logger,
+	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "client init:", err)
 		os.Exit(1)

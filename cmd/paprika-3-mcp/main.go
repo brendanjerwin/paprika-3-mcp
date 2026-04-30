@@ -90,6 +90,7 @@ func main() {
 	}
 	indexPath := filepath.Join(userDir, "recipes.bleve")
 	lockPath := filepath.Join(userDir, "writer.lock")
+	tokenPath := filepath.Join(userDir, "token")
 
 	logger.Info("paprika-3-mcp starting",
 		"version", version,
@@ -112,7 +113,16 @@ func main() {
 	// NewClient no longer logs in synchronously — the actual auth
 	// round-trip happens on first authenticated request, so the MCP
 	// server can answer the `initialize` handshake before that lands.
-	client, err := paprika.NewClient(username, password, version, logger)
+	// The token cache file is in the same per-credential namespace
+	// dir, so sibling processes (other claude sessions, wiki-chat
+	// per-page agents) skip the slow login when one's already done it.
+	client, err := paprika.NewClient(paprika.ClientOptions{
+		Username:       username,
+		Password:       password,
+		Version:        version,
+		Logger:         logger,
+		TokenCachePath: tokenPath,
+	})
 	if err != nil {
 		logger.Error("paprika client init failed", "err", err)
 		os.Exit(1)

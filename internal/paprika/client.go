@@ -14,6 +14,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -27,13 +29,32 @@ func userAgent(version string) string {
 	return fmt.Sprintf("paprika-3-mcp/%s (golang; %s)", version, runtime.Version())
 }
 
+// ClientOptions configures NewClient.
+type ClientOptions struct {
+	Username string
+	Password string
+	Version  string
+	Logger   *slog.Logger
+	// TokenCachePath, if non-empty, is the file the client reads on
+	// startup and writes whenever a fresh login succeeds. The token
+	// is persisted as a single line containing the raw JWT; the file
+	// is created with 0600. Empty = no on-disk caching.
+	TokenCachePath string
+}
+
 // NewClient builds a client that does NOT log in eagerly. The bearer
 // token is fetched lazily on the first authenticated request (and
-// cached thereafter), so callers can construct the client without
-// blocking on Paprika's slow login endpoint. Without this, an MCP
-// stdio server can't respond to the initial `initialize` handshake
-// before the host gives up.
-func NewClient(username, password, version string, logger *slog.Logger) (*Client, error) {
+// cached in memory + optionally on disk thereafter), so callers can
+// construct the client without blocking on Paprika's slow login
+// endpoint. Without this, an MCP stdio server can't respond to the
+// initial `initialize` handshake before the host gives up.
+//
+// The TokenCachePath, if set, lets multiple short-lived processes
+// (e.g. wiki-chat per-page agents) skip the slow login on subsequent
+// spawns. A 401 response invalidates both caches and forces a fresh
+// login on the next request.
+func NewClient(opts ClientOptions) (*Client, error) {
+	logger := opts.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -53,11 +74,24 @@ func NewClient(username, password, version string, logger *slog.Logger) (*Client
 	}
 
 	c := &Client{
-		underlying: t,
-		logger:     logger,
-		username:   username,
-		password:   password,
-		version:    version,
+		underlying:     t,
+		logger:         logger,
+		username:       opts.Username,
+		password:       opts.Password,
+		version:        opts.Version,
+		tokenCachePath: opts.TokenCachePath,
+	}
+
+	// Best-effort warm cache from disk. A read failure (missing file,
+	// truncated, permission denied) just means we'll log in on first
+	// request — no need to surface it.
+	if opts.TokenCachePath != "" {
+		if data, err := os.ReadFile(opts.TokenCachePath); err == nil {
+			if tok := strings.TrimSpace(string(data)); tok != "" {
+				c.token = tok
+				logger.Debug("warmed paprika token from disk", "path", opts.TokenCachePath)
+			}
+		}
 	}
 
 	c.client = &http.Client{
@@ -77,13 +111,17 @@ type Client struct {
 	password string
 	version  string
 
-	tokenMu sync.Mutex
-	token   string
+	tokenMu        sync.Mutex
+	token          string
+	tokenCachePath string
 }
 
 // ensureToken returns the bearer token, performing the login round-trip
 // the first time it's called (or after invalidateToken cleared the
 // cache because of a 401). Subsequent calls return the cached value.
+// On a successful fresh login the token is also persisted to the
+// cache file (if one was configured) so sibling processes can skip
+// the login.
 func (c *Client) ensureToken(ctx context.Context) (string, error) {
 	c.tokenMu.Lock()
 	defer c.tokenMu.Unlock()
@@ -97,6 +135,7 @@ func (c *Client) ensureToken(ctx context.Context) (string, error) {
 	}
 	c.token = tok
 	c.logger.Info("paprika login succeeded")
+	c.persistTokenLocked(tok)
 	return tok, nil
 }
 
@@ -105,11 +144,46 @@ func (c *Client) ensureToken(ctx context.Context) (string, error) {
 // 401, on the assumption that Paprika rotated the JWT or it expired.
 // We compare to the token the failed request used so concurrent calls
 // don't repeatedly invalidate a token that's already been refreshed.
+// The on-disk cache is also removed so a sibling process restart
+// won't read the stale value.
 func (c *Client) invalidateToken(usedToken string) {
 	c.tokenMu.Lock()
 	defer c.tokenMu.Unlock()
 	if c.token == usedToken {
 		c.token = ""
+		c.removeCachedTokenLocked()
+	}
+}
+
+// persistTokenLocked writes the bearer token to disk, atomically,
+// with 0600 permissions. The mutex is assumed already held. Errors
+// are logged but not returned — disk caching is best-effort.
+func (c *Client) persistTokenLocked(tok string) {
+	if c.tokenCachePath == "" {
+		return
+	}
+	dir := filepath.Dir(c.tokenCachePath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		c.logger.Warn("create token cache dir", "dir", dir, "err", err)
+		return
+	}
+	tmp := c.tokenCachePath + ".tmp"
+	if err := os.WriteFile(tmp, []byte(tok+"\n"), 0o600); err != nil {
+		c.logger.Warn("write token cache", "path", tmp, "err", err)
+		return
+	}
+	if err := os.Rename(tmp, c.tokenCachePath); err != nil {
+		c.logger.Warn("rename token cache", "path", c.tokenCachePath, "err", err)
+		_ = os.Remove(tmp)
+	}
+}
+
+func (c *Client) removeCachedTokenLocked() {
+	if c.tokenCachePath == "" {
+		return
+	}
+	if err := os.Remove(c.tokenCachePath); err != nil && !os.IsNotExist(err) {
+		c.logger.Warn("remove token cache", "path", c.tokenCachePath, "err", err)
 	}
 }
 
