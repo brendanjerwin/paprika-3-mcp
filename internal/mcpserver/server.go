@@ -319,16 +319,11 @@ func (s *Server) handleCreate(ctx context.Context, req mcp.CallToolRequest) (*mc
 	}), nil
 }
 
-// tryUpsertLocal writes a saved recipe to the local index. In read-only
-// mode it skips silently — the writer process will pick the change up
-// from Paprika cloud on its next sync pass, and other readers will
-// catch up on their next Reload.
+// tryUpsertLocal writes a saved recipe to the local index. Failures
+// are logged but not surfaced — Paprika cloud is the source of truth
+// and the syncer will pull the new state on its next pass anyway.
 func (s *Server) tryUpsertLocal(r *paprika.Recipe, op string) {
 	if err := s.store.Upsert(r); err != nil {
-		if errors.Is(err, store.ErrReadOnly) {
-			s.logger.Debug("read-only store: skipped local upsert", "op", op, "uid", r.UID)
-			return
-		}
 		s.logger.Warn("local upsert failed", "op", op, "uid", r.UID, "err", err)
 	}
 }

@@ -4,15 +4,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
-	"time"
 
 	"github.com/brendanjerwin/paprika-3-mcp/internal/mcpserver"
 	"github.com/brendanjerwin/paprika-3-mcp/internal/paprika"
@@ -23,7 +22,6 @@ import (
 var version = "dev" // set during build with -ldflags
 
 // defaultDataDir returns ~/.local/state/paprika-3-mcp (XDG_STATE_HOME-aware).
-// Bleve owns this directory.
 func defaultDataDir() string {
 	if x := os.Getenv("XDG_STATE_HOME"); x != "" {
 		return filepath.Join(x, "paprika-3-mcp")
@@ -31,26 +29,76 @@ func defaultDataDir() string {
 	if h := os.Getenv("HOME"); h != "" {
 		return filepath.Join(h, ".local", "state", "paprika-3-mcp")
 	}
-	// Last-resort fallback. Avoids /var/log behavior of upstream that
-	// failed silently for non-root users.
 	return filepath.Join(os.TempDir(), "paprika-3-mcp")
 }
 
 // userNamespace returns a stable 16-hex-char fingerprint of the
-// Paprika username. We hash so the directory name is filesystem-safe
-// and so passwords (which we never read here) can't leak through path
-// inspection. Two processes with different credentials get different
-// directories; same credentials → same directory and they coordinate
-// through flock.
+// Paprika username. Different accounts on the same host get different
+// directories. Hashing the username (not the password) keeps the path
+// safe to inspect.
 func userNamespace(username string) string {
 	sum := sha256.Sum256([]byte(username))
 	return hex.EncodeToString(sum[:8])
 }
 
+// reapStalePIDDirs removes per-PID index directories whose owning
+// process is no longer running. Each paprika-3-mcp process gets its
+// own private Bleve at <userDir>/<pid>/recipes.bleve; without this
+// cleanup the directory accumulates dead siblings forever.
+//
+// The current process's own dir is never reaped (we recreate it
+// immediately afterward, but skipping it explicitly keeps the
+// reaper's intent obvious).
+func reapStalePIDDirs(userDir string, selfPID int, logger *slog.Logger) {
+	entries, err := os.ReadDir(userDir)
+	if err != nil {
+		// Missing dir is fine — first run on this host. Other errors
+		// (permission denied, etc.) shouldn't block startup.
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue // not a PID dir
+		}
+		if pid == selfPID {
+			continue
+		}
+		if pidAlive(pid) {
+			continue
+		}
+		stale := filepath.Join(userDir, e.Name())
+		if err := os.RemoveAll(stale); err != nil {
+			logger.Warn("reap stale pid dir failed", "dir", stale, "err", err)
+			continue
+		}
+		logger.Info("reaped stale per-pid index", "dir", stale, "pid", pid)
+	}
+}
+
+// pidAlive uses the kill(pid, 0) trick: signal 0 doesn't deliver any
+// signal, it just performs permission checks. errors.Is(err, ESRCH)
+// means the process is gone.
+func pidAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	if err := proc.Signal(syscall.Signal(0)); err != nil {
+		return false
+	}
+	return true
+}
+
 func main() {
-	dataDir := flag.String("data-dir", defaultDataDir(), "Per-host root for paprika-3-mcp state. The actual index lives at <data-dir>/<userhash>/recipes.bleve.")
+	dataDir := flag.String("data-dir", defaultDataDir(), "Per-host root for paprika-3-mcp state. The actual index lives at <data-dir>/<userhash>/<pid>/recipes.bleve.")
 	logLevel := flag.String("log-level", "info", "Log level: debug, info, warn, error")
-	readerReopenInterval := flag.Duration("reader-reopen", 60*time.Second, "How often a read-only Store reloads to pick up the writer's commits.")
 	showVersion := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
 
@@ -77,45 +125,33 @@ func main() {
 	case "error":
 		level = slog.LevelError
 	}
-
-	// Logs go to stderr — stdio is reserved for MCP JSON-RPC.
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
-	// Per-credential namespace prevents collisions between different
-	// Paprika accounts on the same host.
+	pid := os.Getpid()
 	userDir := filepath.Join(*dataDir, userNamespace(username))
 	if err := os.MkdirAll(userDir, 0o700); err != nil {
 		logger.Error("create user state dir failed", "dir", userDir, "err", err)
 		os.Exit(1)
 	}
-	indexPath := filepath.Join(userDir, "recipes.bleve")
-	lockPath := filepath.Join(userDir, "writer.lock")
-	tokenPath := filepath.Join(userDir, "token")
+
+	// Best-effort reap of dead siblings before we drop our own per-PID
+	// dir into the namespace. Cheap and bounded by directory size.
+	reapStalePIDDirs(userDir, pid, logger)
+
+	pidDir := filepath.Join(userDir, strconv.Itoa(pid))
+	indexPath := filepath.Join(pidDir, "recipes.bleve")
+	tokenPath := filepath.Join(userDir, "token") // shared across processes for this account
 
 	logger.Info("paprika-3-mcp starting",
 		"version", version,
 		"index", indexPath,
-		"pid", os.Getpid(),
+		"pid", pid,
 	)
 
-	// Try to be the writer. Non-blocking: if another instance already
-	// holds the lock we open read-only and run as a passive consumer.
-	writerLock, lockErr := store.TryLock(lockPath)
-	role := "writer"
-	if errors.Is(lockErr, store.ErrLockHeld) {
-		role = "reader"
-		logger.Info("another writer is active; running read-only", "lock", lockPath)
-	} else if lockErr != nil {
-		logger.Error("acquire writer lock failed", "lock", lockPath, "err", lockErr)
-		os.Exit(1)
-	}
-
-	// NewClient no longer logs in synchronously — the actual auth
-	// round-trip happens on first authenticated request, so the MCP
-	// server can answer the `initialize` handshake before that lands.
-	// The token cache file is in the same per-credential namespace
-	// dir, so sibling processes (other claude sessions, wiki-chat
-	// per-page agents) skip the slow login when one's already done it.
+	// NewClient doesn't log in synchronously — the auth round-trip
+	// happens on first authenticated request, so the MCP server can
+	// answer the `initialize` handshake before that lands. Token
+	// cache is shared across processes for this credential.
 	client, err := paprika.NewClient(paprika.ClientOptions{
 		Username:       username,
 		Password:       password,
@@ -128,38 +164,28 @@ func main() {
 		os.Exit(1)
 	}
 
-	st, err := openStoreWithRetry(indexPath, role == "reader", logger)
+	st, err := store.Open(store.Options{Path: indexPath, Logger: logger})
 	if err != nil {
 		logger.Error("open index failed", "err", err)
 		os.Exit(1)
 	}
-	defer st.Close()
+	defer func() {
+		_ = st.Close()
+		// Drop our private dir on clean exit. Stale dirs from killed
+		// processes are reaped on the next sibling startup via
+		// reapStalePIDDirs.
+		_ = os.RemoveAll(pidDir)
+	}()
 
 	rootCtx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	syncerOpts := syncer.Options{
+	sync := syncer.New(syncer.Options{
 		Client: client,
 		Store:  st,
 		Logger: logger,
-	}
-	var sync *syncer.Syncer
-	if role == "writer" {
-		sync = syncer.New(syncerOpts)
-		go sync.Run(rootCtx)
-		// Held until process exit; OS releases on death.
-		defer writerLock.Close()
-	} else {
-		// Reader: poll the lock so we can take over if the original
-		// writer dies, otherwise just refresh the in-memory index.
-		go runReaderLoop(rootCtx, readerLoopOpts{
-			Store:        st,
-			LockPath:     lockPath,
-			Interval:     *readerReopenInterval,
-			Logger:       logger,
-			SyncerOpts:   syncerOpts,
-		})
-	}
+	})
+	go sync.Run(rootCtx)
 
 	srv, err := mcpserver.NewServer(mcpserver.NewServerOptions{
 		Version: version,
@@ -172,102 +198,10 @@ func main() {
 		logger.Error("server init failed", "err", err)
 		os.Exit(1)
 	}
-	logger.Info("ready", "role", role)
+	logger.Info("ready")
 
 	if err := srv.Serve(rootCtx); err != nil {
 		logger.Error("server exited with error", "err", err)
 		os.Exit(1)
-	}
-}
-
-// openStoreWithRetry handles two flavors of read-only race:
-//   1. The writer hasn't created the index yet — quick retries pick it
-//      up as soon as the writable Open finishes the initial materialize.
-//   2. The writer is busy holding bbolt's exclusive lock and the read-
-//      only open would block forever. store.Open returns
-//      ErrOpenTimedOut for this case (per-attempt 2s here so we get a
-//      handful of retries inside the MCP handshake window).
-//
-// Writers don't retry — Open creates the directory and never has to
-// wait on another holder of the file.
-func openStoreWithRetry(path string, readOnly bool, logger *slog.Logger) (*store.Store, error) {
-	if !readOnly {
-		return store.Open(store.Options{Path: path, ReadOnly: false, Logger: logger})
-	}
-
-	// 4 attempts × ~2s open + 250ms sleep ≈ 9s wall-clock max.
-	const maxAttempts = 4
-	const interval = 250 * time.Millisecond
-	const perAttemptDeadline = 2 * time.Second
-	var lastErr error
-	for i := 0; i < maxAttempts; i++ {
-		st, err := store.Open(store.Options{
-			Path:        path,
-			ReadOnly:    true,
-			OpenTimeout: perAttemptDeadline,
-			Logger:      logger,
-		})
-		if err == nil {
-			return st, nil
-		}
-		lastErr = err
-		logger.Debug("reader open failed; retrying", "err", err, "attempt", i+1)
-		time.Sleep(interval)
-	}
-	return nil, fmt.Errorf("read-only open after %d attempts: %w", maxAttempts, lastErr)
-}
-
-type readerLoopOpts struct {
-	Store      *store.Store
-	LockPath   string
-	Interval   time.Duration
-	Logger     *slog.Logger
-	SyncerOpts syncer.Options
-}
-
-// runReaderLoop is the reader's background goroutine. On each tick it:
-//  1. Tries to acquire the writer flock — if the previous writer died
-//     (or was never around), this reader promotes itself to writer,
-//     reopens the index writable, kicks off the syncer, and exits the
-//     loop holding the lock for the rest of the process lifetime.
-//  2. Otherwise, calls store.Reload() so the in-memory index picks up
-//     commits the current writer has flushed to disk.
-//
-// Promotion is a permanent state change (sticky); a process never
-// demotes back to reader. The flock fd lives in the goroutine so the
-// kernel releases it on process death.
-func runReaderLoop(ctx context.Context, opts readerLoopOpts) {
-	t := time.NewTicker(opts.Interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			lock, err := store.TryLock(opts.LockPath)
-			switch {
-			case err == nil:
-				opts.Logger.Info("writer lock acquired by reader; promoting", "lock", opts.LockPath)
-				if perr := opts.Store.Promote(); perr != nil {
-					opts.Logger.Error("promote store failed; staying reader", "err", perr)
-					_ = lock.Close()
-					goto reload
-				}
-				// Lock is intentionally not closed here — held for
-				// the rest of the process lifetime via the closure.
-				_ = lock // keep reference alive
-				opts.Logger.Info("promoted reader to writer; starting syncer")
-				go syncer.New(opts.SyncerOpts).Run(ctx)
-				return
-			case errors.Is(err, store.ErrLockHeld):
-				// Expected: a different process is the writer.
-			default:
-				opts.Logger.Warn("writer-lock probe failed; will retry", "err", err)
-			}
-		reload:
-			if err := opts.Store.Reload(); err != nil {
-				opts.Logger.Warn("reader reload failed", "err", err)
-			}
-		}
 	}
 }
